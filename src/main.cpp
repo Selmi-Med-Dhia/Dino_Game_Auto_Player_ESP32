@@ -15,8 +15,8 @@ constexpr size_t ADAPT_WARMUP_ENVELOPES = 3;
 
 struct Config {
   int threshold = 200;
-  int restAngle = 20;
-  int clickAngle = 25;
+  int restAngle = 35;
+  int clickAngle = 38;
 
   uint32_t servoHoldMs = 80;
   uint32_t actuatorDelayMs = 160;
