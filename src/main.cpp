@@ -22,13 +22,12 @@ constexpr size_t CLASSIFY_WARMUP = 4;
 
 constexpr float DEFAULT_SENSOR_RATIO = 2.0f;
 
-// Chromium normal-mode speed model. The source increments currentSpeed by
-// exactly 0.001 once per animation-frame update, starting at 6 and capped at 13.
-// We emulate the browser frame rate, but intentionally re-anchor frame 0 to
-// the trailing edge of the first cactus after boot/reset.
+// Chromium / Chromium-derived runner defaults.
 constexpr uint32_t DEFAULT_GAME_FPS = 60;
 constexpr uint32_t MIN_GAME_FPS = 30;
 constexpr uint32_t MAX_GAME_FPS = 360;
+constexpr uint32_t DEFAULT_FIRST_CACTUS_DELAY_MS = 3000;
+constexpr uint32_t MAX_FIRST_CACTUS_DELAY_MS = 10000;
 constexpr float GAME_START_SPEED = 6.0f;
 constexpr float GAME_MAX_SPEED = 13.0f;
 constexpr float GAME_ACCEL_PER_FRAME = 0.001f;
@@ -39,7 +38,7 @@ constexpr uint16_t CONFIG_VERSION = 3;
 
 enum class ThemeMode : uint8_t { Auto, Light, Dark };
 
-// Exact v1/v2 layout, kept only for NVS migration.
+// Exact firmware-v1/v2 layout.
 struct LegacyConfig {
   uint32_t magic;
   uint16_t version;
@@ -64,21 +63,18 @@ struct LegacyConfig {
   bool debug;
 };
 
-// Keep this layout unchanged from firmware v3 so existing calibration survives.
+// Keep firmware-v3 layout unchanged so current NVS calibration survives.
 struct Config {
   uint32_t magic = CONFIG_MAGIC;
   uint16_t version = CONFIG_VERSION;
   int threshold = 200;
   int restAngle = 35;
   int pressAngle = 38;
-
   uint32_t holdMs = 80;
   uint32_t airMs = 450;
-
   uint32_t longHoldMs = 160;
   uint32_t longAirMs = 520;
   float longAtWidths = 1.60f;
-
   uint32_t actuatorMs = 160;
   uint32_t travelMs = 1550;
   uint32_t minTravelMs = 350;
@@ -89,9 +85,8 @@ struct Config {
   uint32_t rearmMs = 12;
   uint32_t themeFlipMs = 1500;
   uint32_t sampleMs = 5;
-
-  bool adapt = true;          // enables Chromium frame-step acceleration scaling
-  float adaptStepPct = 3.0f; // retained only for NVS compatibility
+  bool adapt = true;
+  float adaptStepPct = 3.0f;  // NVS compatibility only.
   ThemeMode theme = ThemeMode::Auto;
   bool debug = false;
 };
@@ -111,28 +106,25 @@ struct Detector {
   uint64_t startMs = 0;
   uint64_t lastObstacleMs = 0;
   uint64_t oppositeSinceMs = 0;
-
   uint64_t lastLandingMs = 0;
   uint64_t lastCommandMs = 0;
   bool hasPlan = false;
-
   uint32_t widthHistory[WIDTH_HISTORY_SIZE] = {};
   size_t widthCount = 0;
   size_t widthIndex = 0;
-
   bool roundStarted = false;
   uint64_t roundStartMs = 0;
-  float speedScale = 1.0f;
+  uint32_t baseFrame = 0;
   uint32_t speedFrame = 0;
+  float baseGameSpeed = GAME_START_SPEED;
+  float gameSpeed = GAME_START_SPEED;
+  float speedScale = 1.0f;
   uint32_t travelMs = 0;
   uint32_t gapMs = 0;
-
   uint32_t plannedJumps = 0;
 };
 
-struct LogMessage {
-  char text[176];
-};
+struct LogMessage { char text[192]; };
 
 struct UIntSetting {
   const char *name;
@@ -166,11 +158,11 @@ Detector detector;
 
 float sensorRatio = DEFAULT_SENSOR_RATIO;
 uint32_t gameFps = DEFAULT_GAME_FPS;
+uint32_t firstCactusDelayMs = DEFAULT_FIRST_CACTUS_DELAY_MS;
 
 QueueHandle_t clickQueue = nullptr;
 QueueHandle_t logQueue = nullptr;
 SemaphoreHandle_t stateMutex = nullptr;
-
 TaskHandle_t sensorTaskHandle = nullptr;
 TaskHandle_t servoTaskHandle = nullptr;
 TaskHandle_t serialTaskHandle = nullptr;
@@ -241,7 +233,6 @@ bool parseBool(String text, bool &value) {
 
 void queueLog(const char *format, ...) {
   if (!logQueue) return;
-
   LogMessage message{};
   va_list args;
   va_start(args, format);
@@ -249,10 +240,6 @@ void queueLog(const char *format, ...) {
   va_end(args);
   xQueueSend(logQueue, &message, 0);
 }
-
-// --------------------------------------------------------------------------
-// Persistent configuration
-// --------------------------------------------------------------------------
 
 bool configValid(const Config &c) {
   return c.magic == CONFIG_MAGIC &&
@@ -324,7 +311,6 @@ void migrateLegacy(const LegacyConfig &old) {
 
 bool saveConfig(bool announce = true) {
   if (!prefsReady) return false;
-
   Config copy = getConfig();
   bool ok = prefs.putBytes("config", &copy, sizeof(copy)) == sizeof(copy);
   if (announce) {
@@ -367,23 +353,20 @@ void loadConfig() {
   prefs.putBytes("config", &config, sizeof(config));
 
   sensorRatio = prefs.getFloat("ratio", DEFAULT_SENSOR_RATIO);
-  if (sensorRatio < 0.5f || sensorRatio > 6.0f) {
+  if (sensorRatio < 0.5f || sensorRatio > 6.0f)
     sensorRatio = DEFAULT_SENSOR_RATIO;
-  }
 
   gameFps = prefs.getUInt("gamefps", DEFAULT_GAME_FPS);
-  if (gameFps < MIN_GAME_FPS || gameFps > MAX_GAME_FPS) {
+  if (gameFps < MIN_GAME_FPS || gameFps > MAX_GAME_FPS)
     gameFps = DEFAULT_GAME_FPS;
-  }
+
+  firstCactusDelayMs =
+      prefs.getUInt("firstdelay", DEFAULT_FIRST_CACTUS_DELAY_MS);
+  if (firstCactusDelayMs > MAX_FIRST_CACTUS_DELAY_MS)
+    firstCactusDelayMs = DEFAULT_FIRST_CACTUS_DELAY_MS;
 }
 
-// --------------------------------------------------------------------------
-// Sensor + round-time model
-// --------------------------------------------------------------------------
-
-int readSensor() {
-  return analogRead(SENSOR_PIN);
-}
+int readSensor() { return analogRead(SENSOR_PIN); }
 
 int median3(int a, int b, int c) {
   if (a > b) { int t = a; a = b; b = t; }
@@ -404,33 +387,53 @@ void resetEnvelopeLocked() {
   detector.oppositeSinceMs = 0;
 }
 
+uint32_t estimatedBaseFrameLocked() {
+  uint64_t base =
+      static_cast<uint64_t>(firstCactusDelayMs) * gameFps / 1000ULL;
+  if (base > GAME_MAX_ACCEL_FRAMES) base = GAME_MAX_ACCEL_FRAMES;
+  return static_cast<uint32_t>(base);
+}
+
+float speedForFrame(uint32_t frame) {
+  float speed = GAME_START_SPEED + GAME_ACCEL_PER_FRAME * frame;
+  return speed > GAME_MAX_SPEED ? GAME_MAX_SPEED : speed;
+}
+
 void resetRoundLocked() {
   detector = Detector{};
   detector.travelMs = config.travelMs;
   detector.gapMs = config.gapMs;
+  detector.baseFrame = estimatedBaseFrameLocked();
+  detector.baseGameSpeed = speedForFrame(detector.baseFrame);
+  detector.gameSpeed = detector.baseGameSpeed;
 }
 
 void updateRoundTimingLocked(uint64_t now) {
+  detector.baseFrame = estimatedBaseFrameLocked();
+  detector.baseGameSpeed = speedForFrame(detector.baseFrame);
+
+  uint32_t absoluteFrame = detector.baseFrame;
+  float speed = detector.baseGameSpeed;
   float scale = 1.0f;
-  uint32_t frame = 0;
 
   if (config.adapt && detector.roundStarted && now > detector.roundStartMs) {
-    const uint64_t elapsedMs = now - detector.roundStartMs;
+    uint64_t elapsedMs = now - detector.roundStartMs;
+    uint64_t roundFrames = elapsedMs * gameFps / 1000ULL;
+    uint64_t absoluteFrames =
+        static_cast<uint64_t>(detector.baseFrame) + roundFrames;
 
-    // Chromium does not accelerate per cactus. In normal mode it runs
-    // `currentSpeed += 0.001` once per requestAnimationFrame callback. The
-    // callback rate normally follows the display refresh rate, so gameFps is
-    // configurable to match the monitor running Chrome.
-    uint64_t frames64 = elapsedMs * gameFps / 1000ULL;
-    if (frames64 > GAME_MAX_ACCEL_FRAMES) frames64 = GAME_MAX_ACCEL_FRAMES;
-    frame = static_cast<uint32_t>(frames64);
+    if (absoluteFrames > GAME_MAX_ACCEL_FRAMES)
+      absoluteFrames = GAME_MAX_ACCEL_FRAMES;
 
-    float speed = GAME_START_SPEED + GAME_ACCEL_PER_FRAME * frame;
-    if (speed > GAME_MAX_SPEED) speed = GAME_MAX_SPEED;
-    scale = speed / GAME_START_SPEED;
+    absoluteFrame = static_cast<uint32_t>(absoluteFrames);
+    speed = speedForFrame(absoluteFrame);
+
+    if (detector.baseGameSpeed > 0.0f)
+      scale = speed / detector.baseGameSpeed;
   }
 
-  detector.speedFrame = frame;
+  detector.speedFrame = absoluteFrame;
+  detector.gameSpeed = speed;
   detector.speedScale = scale;
 
   uint32_t travel =
@@ -454,22 +457,25 @@ void startRoundLocked(uint64_t firstCactusExitMs) {
 uint32_t roundElapsedMsLocked(uint64_t now) {
   if (!detector.roundStarted || now <= detector.roundStartMs) return 0;
   uint64_t elapsed = now - detector.roundStartMs;
-  return elapsed > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed);
+  return elapsed > UINT32_MAX
+      ? UINT32_MAX
+      : static_cast<uint32_t>(elapsed);
 }
 
 void pushWidthPulseLocked(uint32_t pulseMs) {
   detector.widthHistory[detector.widthIndex] = pulseMs;
-  detector.widthIndex = (detector.widthIndex + 1) % WIDTH_HISTORY_SIZE;
-  if (detector.widthCount < WIDTH_HISTORY_SIZE) ++detector.widthCount;
+  detector.widthIndex =
+      (detector.widthIndex + 1) % WIDTH_HISTORY_SIZE;
+  if (detector.widthCount < WIDTH_HISTORY_SIZE)
+    ++detector.widthCount;
 }
 
 uint32_t widthReferenceLocked() {
   if (!detector.widthCount) return 0;
 
   uint32_t values[WIDTH_HISTORY_SIZE];
-  for (size_t i = 0; i < detector.widthCount; ++i) {
+  for (size_t i = 0; i < detector.widthCount; ++i)
     values[i] = detector.widthHistory[i];
-  }
 
   for (size_t i = 1; i < detector.widthCount; ++i) {
     uint32_t value = values[i];
@@ -487,7 +493,8 @@ uint32_t widthReferenceLocked() {
 }
 
 float estimateWidthLocked(uint32_t pulseMs, uint32_t referenceMs) {
-  if (!referenceMs || detector.widthCount < CLASSIFY_WARMUP) return 1.0f;
+  if (!referenceMs || detector.widthCount < CLASSIFY_WARMUP)
+    return 1.0f;
 
   float cactusMs = referenceMs / (sensorRatio + 1.0f);
   float sensorMs = referenceMs - cactusMs;
@@ -497,13 +504,10 @@ float estimateWidthLocked(uint32_t pulseMs, uint32_t referenceMs) {
   return widths < 0.5f ? 0.5f : widths;
 }
 
-// --------------------------------------------------------------------------
-// Servo scheduler
-// --------------------------------------------------------------------------
-
 void clearClickQueue() {
   ClickCommand ignored{};
-  while (clickQueue && xQueueReceive(clickQueue, &ignored, 0) == pdTRUE) {}
+  while (clickQueue &&
+         xQueueReceive(clickQueue, &ignored, 0) == pdTRUE) {}
 }
 
 bool queueClick(uint64_t atMs, bool manual,
@@ -526,7 +530,6 @@ bool queueClick(uint64_t atMs, bool manual, bool longJump = false) {
 void insertPending(ClickCommand *pending, size_t &count,
                    const ClickCommand &cmd) {
   if (count >= CLICK_QUEUE_SIZE) return;
-
   size_t i = count;
   while (i && pending[i - 1].atMs > cmd.atMs) {
     pending[i] = pending[i - 1];
@@ -540,9 +543,8 @@ void prunePending(ClickCommand *pending, size_t &count) {
   size_t out = 0;
   for (size_t i = 0; i < count; ++i) {
     if (pending[i].manual ||
-        (playing && pending[i].generation == playGeneration)) {
+        (playing && pending[i].generation == playGeneration))
       pending[out++] = pending[i];
-    }
   }
   count = out;
 }
@@ -569,17 +571,16 @@ void servoTask(void *) {
       insertPending(pending, count, incoming);
       continue;
     }
-
     if (!count) continue;
 
     ClickCommand cmd = pending[0];
-    for (size_t i = 1; i < count; ++i) pending[i - 1] = pending[i];
+    for (size_t i = 1; i < count; ++i)
+      pending[i - 1] = pending[i];
     --count;
 
     if (!cmd.manual &&
-        (!playing || cmd.generation != playGeneration)) {
+        (!playing || cmd.generation != playGeneration))
       continue;
-    }
 
     uint64_t actual = nowMs();
     servo.write(cmd.pressAngle);
@@ -598,10 +599,6 @@ void servoTask(void *) {
   }
 }
 
-// --------------------------------------------------------------------------
-// Obstacle classification + planning
-// --------------------------------------------------------------------------
-
 void finalizeEnvelopeLocked(uint64_t now) {
   if (!detector.active ||
       detector.lastObstacleMs < detector.startMs) {
@@ -614,14 +611,14 @@ void finalizeEnvelopeLocked(uint64_t now) {
           detector.lastObstacleMs - detector.startMs);
   if (!pulseMs) pulseMs = 1;
 
-  // The first fully-passed cactus after boot/reset/arm/start defines round t=0.
   startRoundLocked(detector.lastObstacleMs);
   updateRoundTimingLocked(now);
 
   pushWidthPulseLocked(pulseMs);
   uint32_t referenceMs = widthReferenceLocked();
 
-  float widthEstimate = estimateWidthLocked(pulseMs, referenceMs);
+  float widthEstimate =
+      estimateWidthLocked(pulseMs, referenceMs);
   bool longJump =
       detector.widthCount < CLASSIFY_WARMUP ||
       widthEstimate >= config.longAtWidths;
@@ -629,6 +626,7 @@ void finalizeEnvelopeLocked(uint64_t now) {
   float sensorFootprintMs = referenceMs
       ? referenceMs * sensorRatio / (sensorRatio + 1.0f)
       : pulseMs * sensorRatio / (sensorRatio + 1.0f);
+
   int64_t edgeCorrection =
       static_cast<int64_t>(sensorFootprintMs * 0.5f);
 
@@ -669,7 +667,6 @@ void finalizeEnvelopeLocked(uint64_t now) {
       commandAt = afterLanding;
       delayedLanding = true;
     }
-
     if (commandAt < afterCooldown) {
       commandAt = afterCooldown;
       delayedCooldown = true;
@@ -678,9 +675,8 @@ void finalizeEnvelopeLocked(uint64_t now) {
 
   uint64_t lateMs = 0;
   if (commandAt < static_cast<int64_t>(now)) {
-    lateMs =
-        static_cast<uint64_t>(
-            static_cast<int64_t>(now) - commandAt);
+    lateMs = static_cast<uint64_t>(
+        static_cast<int64_t>(now) - commandAt);
     commandAt = static_cast<int64_t>(now);
   }
 
@@ -703,13 +699,15 @@ void finalizeEnvelopeLocked(uint64_t now) {
 
     uint32_t roundMs = roundElapsedMsLocked(now);
     queueLog(
-        "[PLAN] #%lu %s width=%.2f round=%.1fs frame=%lu speed=x%.3f "
-        "travel=%lu gap=%lu hold=%lu cmd-in=%lld late=%llu %s",
+        "[PLAN] #%lu %s width=%.2f round=%.1fs frame=%lu "
+        "game=%.3f scale=x%.3f travel=%lu gap=%lu hold=%lu "
+        "cmd-in=%lld late=%llu %s",
         static_cast<unsigned long>(detector.plannedJumps),
         longJump ? "LONG" : "SHORT",
         widthEstimate,
         roundMs / 1000.0f,
         static_cast<unsigned long>(detector.speedFrame),
+        detector.gameSpeed,
         detector.speedScale,
         static_cast<unsigned long>(detector.travelMs),
         static_cast<unsigned long>(detector.gapMs),
@@ -723,10 +721,6 @@ void finalizeEnvelopeLocked(uint64_t now) {
 
   resetEnvelopeLocked();
 }
-
-// --------------------------------------------------------------------------
-// Sensor task
-// --------------------------------------------------------------------------
 
 void sensorTask(void *) {
   TickType_t wake = xTaskGetTickCount();
@@ -754,7 +748,6 @@ void sensorTask(void *) {
     filteredWhite =
         classifyWhite(adc, config.threshold, filteredWhite);
 
-    // Frame-step scaling is deterministic and independent of obstacle width.
     updateRoundTimingLocked(now);
 
     if (playing) {
@@ -763,9 +756,8 @@ void sensorTask(void *) {
 
       if (config.theme == ThemeMode::Auto) {
         if (obstacle) {
-          if (!detector.oppositeSinceMs) {
+          if (!detector.oppositeSinceMs)
             detector.oppositeSinceMs = now;
-          }
 
           if (now - detector.oppositeSinceMs >=
               config.themeFlipMs) {
@@ -795,10 +787,9 @@ void sensorTask(void *) {
 
     xSemaphoreGive(stateMutex);
 
-    if (themeChanged) {
+    if (themeChanged)
       queueLog("[THEME] Background rebased to %s.",
                colorName(newBackground));
-    }
   }
 }
 
@@ -815,21 +806,18 @@ void chooseBackground() {
   xSemaphoreGive(stateMutex);
 }
 
-// --------------------------------------------------------------------------
-// Serial console
-// --------------------------------------------------------------------------
-
 void printManual() {
   Serial.println(
       "\nstart | arm | stop | click | longclick | show | sensor | reset | defaults");
   Serial.println("theme auto|light|dark");
   Serial.println("<name> <value>  (auto-saved)");
-  Serial.println("threshold rest press hold longhold air longair longat");
+  Serial.println(
+      "threshold rest press hold longhold air longair longat");
   Serial.println(
       "actuator travel mintravel landing clearance gap sample cooldown rearm");
-  Serial.println("ratio gamefps adapt debug");
+  Serial.println("ratio gamefps firstdelay adapt debug");
   Serial.println(
-      "Round clock: first cactus = frame 0; speed += 0.001 each browser frame\n");
+      "firstdelay=ms before first cactus (Chrome/ChromeDino default ~3000)\n");
 }
 
 void printStatus() {
@@ -840,8 +828,12 @@ void printStatus() {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   float ratio = sensorRatio;
   uint32_t fps = gameFps;
-  float speed = detector.speedScale;
+  uint32_t delayMs = firstCactusDelayMs;
+  uint32_t baseFrame = detector.baseFrame;
   uint32_t speedFrame = detector.speedFrame;
+  float baseSpeed = detector.baseGameSpeed;
+  float gameSpeed = detector.gameSpeed;
+  float scale = detector.speedScale;
   uint32_t effectiveTravel = detector.travelMs;
   uint32_t effectiveGap = detector.gapMs;
   bool bg = backgroundIsWhite;
@@ -855,10 +847,8 @@ void printStatus() {
       "Run=%s | round=%s",
       playing ? "ON" : "OFF",
       roundStarted ? "RUNNING" : "WAITING FOR FIRST CACTUS");
-
-  if (roundStarted) {
+  if (roundStarted)
     Serial.printf(" (%.1f s)", roundMs / 1000.0f);
-  }
   Serial.println();
 
   Serial.printf(
@@ -880,9 +870,15 @@ void printStatus() {
       static_cast<unsigned long>(ref));
 
   Serial.printf(
-      "Acceleration: frame=%lu speed=x%.3f | timed=%s | +0.001/frame @%luHz\n",
-      static_cast<unsigned long>(speedFrame), speed, onOff(cfg.adapt),
-      static_cast<unsigned long>(fps));
+      "Acceleration: base frame=%lu speed=%.3f | frame=%lu speed=%.3f scale=x%.3f\n",
+      static_cast<unsigned long>(baseFrame), baseSpeed,
+      static_cast<unsigned long>(speedFrame), gameSpeed, scale);
+
+  Serial.printf(
+      "Game model: +0.001/frame @%luHz | firstdelay=%lums | timed=%s\n",
+      static_cast<unsigned long>(fps),
+      static_cast<unsigned long>(delayMs),
+      onOff(cfg.adapt));
 
   Serial.printf(
       "Timing: travel=%lu->%lu gap=%lu->%lu actuator=%lu landing=%lu clearance=%lu\n",
@@ -917,13 +913,12 @@ void armFreshRound(bool clickToStart) {
   clearClickQueue();
 
   Serial.printf(
-      "[ARM] Ready. Round clock will start when the next cactus passes. "
+      "[ARM] Ready. Next cactus is timing baseline. "
       "Background=%s sensor=%d.\n",
       colorName(bg), adc);
 
-  if (clickToStart && queueClick(now, true, false)) {
+  if (clickToStart && queueClick(now, true, false))
     Serial.println("[START] Initial short click queued.");
-  }
 }
 
 void stopAutoplay() {
@@ -939,11 +934,7 @@ void stopAutoplay() {
   Serial.println("[STOP] Autoplay stopped.");
 }
 
-enum class SetResult {
-  Changed,
-  Invalid,
-  Unknown
-};
+enum class SetResult { Changed, Invalid, Unknown };
 
 SetResult setParameter(String rawName, String value) {
   String name = normalize(rawName);
@@ -952,13 +943,12 @@ SetResult setParameter(String rawName, String value) {
   if (name == "gamefps" || name == "fps") {
     if (!parseLong(value, number) ||
         number < static_cast<long>(MIN_GAME_FPS) ||
-        number > static_cast<long>(MAX_GAME_FPS)) {
+        number > static_cast<long>(MAX_GAME_FPS))
       return SetResult::Invalid;
-    }
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     gameFps = static_cast<uint32_t>(number);
-    updateRoundTimingLocked(nowMs());
+    resetRoundLocked();
     xSemaphoreGive(stateMutex);
 
     if (prefsReady) prefs.putUInt("gamefps", gameFps);
@@ -967,12 +957,33 @@ SetResult setParameter(String rawName, String value) {
     return SetResult::Changed;
   }
 
+  if (name == "firstdelay" ||
+      name == "cleartime" ||
+      name == "firstcactusdelay") {
+    if (!parseLong(value, number) ||
+        number < 0 ||
+        static_cast<uint32_t>(number) >
+            MAX_FIRST_CACTUS_DELAY_MS)
+      return SetResult::Invalid;
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    firstCactusDelayMs = static_cast<uint32_t>(number);
+    resetRoundLocked();
+    xSemaphoreGive(stateMutex);
+
+    if (prefsReady)
+      prefs.putUInt("firstdelay", firstCactusDelayMs);
+
+    Serial.printf("[SET] firstdelay = %lu ms\n",
+                  static_cast<unsigned long>(firstCactusDelayMs));
+    return SetResult::Changed;
+  }
+
   if (name == "ratio") {
     float ratio;
     if (!parseFloatValue(value, ratio) ||
-        ratio < 0.5f || ratio > 6.0f) {
+        ratio < 0.5f || ratio > 6.0f)
       return SetResult::Invalid;
-    }
 
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     sensorRatio = ratio;
@@ -1000,16 +1011,15 @@ SetResult setParameter(String rawName, String value) {
     }
 
     if (name == "threshold" &&
-        number >= 0 && number <= 4095) {
+        number >= 0 && number <= 4095)
       config.threshold = static_cast<int>(number);
-    } else if (name == "rest" &&
-               number >= 0 && number <= 180) {
+    else if (name == "rest" &&
+             number >= 0 && number <= 180)
       config.restAngle = static_cast<int>(number);
-    } else if (
-        (name == "press" || name == "clickangle") &&
-        number >= 0 && number <= 180) {
+    else if ((name == "press" || name == "clickangle") &&
+             number >= 0 && number <= 180)
       config.pressAngle = static_cast<int>(number);
-    } else {
+    else {
       xSemaphoreGive(stateMutex);
       return SetResult::Invalid;
     }
@@ -1036,10 +1046,11 @@ SetResult setParameter(String rawName, String value) {
     } else {
       config.theme =
           flag ? ThemeMode::Auto :
-          (backgroundIsWhite ? ThemeMode::Light : ThemeMode::Dark);
+          (backgroundIsWhite
+              ? ThemeMode::Light
+              : ThemeMode::Dark);
       refreshBackground = true;
     }
-
     changed = true;
 
   } else if (name == "longat") {
@@ -1053,8 +1064,6 @@ SetResult setParameter(String rawName, String value) {
     changed = true;
 
   } else if (name == "adaptstep") {
-    // Kept only so old serial habits do not fail. Frame-step acceleration does
-    // not need a per-obstacle step anymore, but the value remains in NVS v3.
     float valueFloat;
     if (!parseFloatValue(value, valueFloat) ||
         valueFloat <= 0 || valueFloat > 20) {
@@ -1066,7 +1075,8 @@ SetResult setParameter(String rawName, String value) {
 
   } else {
     for (const auto &setting : UINT_SETTINGS) {
-      if (name != setting.name && name != setting.legacy) continue;
+      if (name != setting.name && name != setting.legacy)
+        continue;
 
       if (!parseLong(value, number) ||
           number < 0 ||
@@ -1131,6 +1141,7 @@ void restoreDefaults() {
   config = Config{};
   sensorRatio = DEFAULT_SENSOR_RATIO;
   gameFps = DEFAULT_GAME_FPS;
+  firstCactusDelayMs = DEFAULT_FIRST_CACTUS_DELAY_MS;
   resetRoundLocked();
   bool moveRest = !playing;
   int rest = config.restAngle;
@@ -1143,6 +1154,7 @@ void restoreDefaults() {
   if (prefsReady) {
     prefs.putFloat("ratio", DEFAULT_SENSOR_RATIO);
     prefs.putUInt("gamefps", DEFAULT_GAME_FPS);
+    prefs.putUInt("firstdelay", DEFAULT_FIRST_CACTUS_DELAY_MS);
   }
 
   Serial.println("[DEFAULTS] Defaults restored and saved.");
@@ -1168,42 +1180,31 @@ void handleCommand(String line) {
   if (command == "help" ||
       command == "manual" ||
       command == "?") {
-    // Manual is printed after every command.
-
   } else if (command == "start" ||
              command == "run") {
     armFreshRound(true);
-
   } else if (command == "arm") {
     armFreshRound(false);
-
   } else if (command == "stop" ||
              command == "pause") {
     stopAutoplay();
-
   } else if (command == "click" ||
              command == "jump") {
-    if (queueClick(nowMs(), true, false)) {
+    if (queueClick(nowMs(), true, false))
       Serial.println("[MANUAL] Short click queued.");
-    }
-
   } else if (command == "longclick" ||
              command == "longjump") {
-    if (queueClick(nowMs(), true, true)) {
+    if (queueClick(nowMs(), true, true))
       Serial.println("[MANUAL] Long click queued.");
-    }
-
   } else if (command == "show" ||
              command == "status") {
     printStatus();
-
   } else if (command == "sensor") {
     Config cfg = getConfig();
     int adc = readSensor();
     Serial.printf(
         "[SENSOR] ADC=%d -> %s (threshold=%d)\n",
         adc, colorName(adc > cfg.threshold), cfg.threshold);
-
   } else if (command == "reset") {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     ++playGeneration;
@@ -1213,26 +1214,20 @@ void handleCommand(String line) {
     clearClickQueue();
 
     Serial.println(
-        "[RESET] Round reset. Autoplay remains armed; "
-        "the next cactus becomes t=0.");
-
+        "[RESET] Round reset. Autoplay stays armed; "
+        "next cactus becomes the calibrated baseline.");
   } else if (command == "defaults") {
     restoreDefaults();
-
   } else if (command == "theme") {
-    if (!setTheme(value)) {
+    if (!setTheme(value))
       Serial.println(
           "[ERR] Use: theme auto | theme light | theme dark");
-    }
-
   } else if (value.length()) {
     SetResult result = setParameter(command, value);
-    if (result == SetResult::Invalid) {
+    if (result == SetResult::Invalid)
       Serial.println("[ERR] Invalid value.");
-    } else if (result == SetResult::Unknown) {
+    else if (result == SetResult::Unknown)
       Serial.println("[ERR] Unknown setting.");
-    }
-
   } else {
     Serial.println("[ERR] Unknown command.");
   }
@@ -1241,9 +1236,8 @@ void handleCommand(String line) {
 void serialTask(void *) {
   for (;;) {
     LogMessage message{};
-    while (xQueueReceive(logQueue, &message, 0) == pdTRUE) {
+    while (xQueueReceive(logQueue, &message, 0) == pdTRUE)
       Serial.println(message.text);
-    }
 
     while (Serial.available()) {
       char c = static_cast<char>(Serial.read());
@@ -1265,9 +1259,8 @@ void serialTask(void *) {
 
 void fatal(const char *message) {
   Serial.println(message);
-  for (;;) {
+  for (;;)
     vTaskDelay(pdMS_TO_TICKS(1000));
-  }
 }
 
 }  // namespace
@@ -1280,15 +1273,14 @@ void setup() {
   analogReadResolution(12);
 
   stateMutex = xSemaphoreCreateMutex();
-  if (!stateMutex) {
+  if (!stateMutex)
     fatal("[FATAL] Could not create state mutex.");
-  }
 
   loadConfig();
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   resetRoundLocked();
-  playing = true;  // Always armed after boot/reset.
+  playing = true;
   ++playGeneration;
   xSemaphoreGive(stateMutex);
 
@@ -1301,9 +1293,8 @@ void setup() {
   logQueue =
       xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogMessage));
 
-  if (!clickQueue || !logQueue) {
+  if (!clickQueue || !logQueue)
     fatal("[FATAL] Could not create runtime queues.");
-  }
 
   chooseBackground();
 
@@ -1321,10 +1312,10 @@ void setup() {
 
   Serial.println(
       "\nDino ESP32 Auto-Player ready "
-      "(auto-armed + Chromium frame-step acceleration).");
+      "(auto-armed + first-cactus calibrated acceleration).");
   Serial.println(
-      "[AUTO] Waiting for the first cactus; "
-      "its trailing edge becomes round t=0.");
+      "[AUTO] Waiting for first cactus. "
+      "Its timing becomes scale x1.000.");
   Serial.println(
       "Runtime: sensor task + servo task + serial task. "
       "loop() stays idle.");
