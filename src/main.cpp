@@ -17,11 +17,16 @@ constexpr int SENSOR_HYSTERESIS = 8;
 constexpr size_t CLICK_QUEUE_SIZE = 12;
 constexpr size_t LOG_QUEUE_SIZE = 16;
 constexpr size_t WIDTH_HISTORY_SIZE = 15;
-constexpr size_t SPEED_HISTORY_SIZE = 7;
 constexpr size_t CLASSIFY_WARMUP = 4;
-constexpr size_t ADAPT_WARMUP = 5;
+constexpr size_t SPEED_BASELINE_WARMUP = 10;
 constexpr float DEFAULT_SENSOR_RATIO = 2.0f;
-constexpr float ADAPT_SAFETY_BIAS = 1.05f;
+
+// Chrome normal mode starts at 6, accelerates by about 0.001 per frame,
+// and caps at 13. This is only used to compensate the short learning warmup;
+// optical pulse timing drives the speed estimate after that.
+constexpr float CHROME_START_SPEED = 6.0f;
+constexpr float CHROME_MAX_SPEED = 13.0f;
+constexpr float CHROME_ACCEL_PER_SECOND = 0.060f;
 constexpr uint32_t CONFIG_MAGIC = 0xD1A02026;
 constexpr uint16_t CONFIG_VERSION = 3;
 
@@ -108,10 +113,13 @@ struct Detector {
   size_t widthCount = 0;
   size_t widthIndex = 0;
 
-  uint32_t speedHistory[SPEED_HISTORY_SIZE] = {};
-  size_t speedCount = 0;
-  size_t speedIndex = 0;
   uint32_t baselinePulseMs = 0;
+  float baselineSpeedScale = 1.0f;
+  float speedScale = 1.0f;
+  uint32_t gapMs = 0;
+
+  bool freshStart = false;
+  uint64_t gameStartMs = 0;
   uint32_t plannedJumps = 0;
 };
 
@@ -345,6 +353,7 @@ void resetEnvelopeLocked() {
 void resetTimingLocked() {
   detector = Detector{};
   detector.travelMs = config.travelMs;
+  detector.gapMs = config.gapMs;
 }
 
 void pushWidthPulseLocked(uint32_t pulseMs) {
@@ -368,39 +377,85 @@ uint32_t widthReferenceLocked() {
 }
 
 uint32_t speedReferenceLocked() {
-  if (!detector.speedCount) return 0;
-  uint32_t values[SPEED_HISTORY_SIZE];
-  for (size_t i = 0; i < detector.speedCount; ++i) values[i] = detector.speedHistory[i];
-  for (size_t i = 1; i < detector.speedCount; ++i) {
+  if (!detector.widthCount) return 0;
+
+  uint32_t values[WIDTH_HISTORY_SIZE];
+  for (size_t i = 0; i < detector.widthCount; ++i)
+    values[i] = detector.widthHistory[i];
+
+  for (size_t i = 1; i < detector.widthCount; ++i) {
     uint32_t v = values[i];
     size_t j = i;
-    while (j && values[j - 1] > v) { values[j] = values[j - 1]; --j; }
+    while (j && values[j - 1] > v) {
+      values[j] = values[j - 1];
+      --j;
+    }
     values[j] = v;
   }
-  size_t index = (detector.speedCount * 35) / 100;
-  return values[index < detector.speedCount ? index : detector.speedCount - 1];
+
+  // Second-smallest pulse reacts to acceleration quickly while ignoring most
+  // wide cactus groups. Width classification keeps its existing third-smallest
+  // reference, so the working SHORT/LONG behavior is unchanged.
+  size_t index = detector.widthCount >= 2 ? 1 : 0;
+  return values[index];
 }
 
-void updateTravelLocked(uint32_t shortPulseMs) {
-  detector.speedHistory[detector.speedIndex] = shortPulseMs;
-  detector.speedIndex = (detector.speedIndex + 1) % SPEED_HISTORY_SIZE;
-  if (detector.speedCount < SPEED_HISTORY_SIZE) ++detector.speedCount;
+float expectedFreshStartScaleLocked(uint64_t now) {
+  if (!detector.freshStart || now <= detector.gameStartMs) return 1.0f;
 
-  uint32_t pulse = speedReferenceLocked();
-  if (!detector.baselinePulseMs && detector.speedCount >= ADAPT_WARMUP)
-    detector.baselinePulseMs = pulse;
-  if (!config.adapt || !detector.baselinePulseMs || pulse >= detector.baselinePulseMs) return;
+  float elapsedS =
+      static_cast<float>(now - detector.gameStartMs) / 1000.0f;
+  float speed = CHROME_START_SPEED + CHROME_ACCEL_PER_SECOND * elapsedS;
+  if (speed > CHROME_MAX_SPEED) speed = CHROME_MAX_SPEED;
+  return speed / CHROME_START_SPEED;
+}
 
-  float target = static_cast<float>(config.travelMs) * pulse /
-                 detector.baselinePulseMs * ADAPT_SAFETY_BIAS;
-  if (target < config.minTravelMs) target = config.minTravelMs;
-  if (target >= detector.travelMs) return;
+void updateSpeedLocked(uint32_t pulseMs, uint64_t now) {
+  if (!config.adapt) {
+    detector.speedScale = 1.0f;
+    detector.travelMs = config.travelMs;
+    detector.gapMs = config.gapMs;
+    return;
+  }
 
-  uint32_t drop = static_cast<uint32_t>(detector.travelMs * config.adaptStepPct / 100.0f);
-  if (!drop) drop = 1;
-  uint32_t floor = detector.travelMs > drop ? detector.travelMs - drop : config.minTravelMs;
-  detector.travelMs = static_cast<uint32_t>(target > floor ? target : floor);
-  if (detector.travelMs < config.minTravelMs) detector.travelMs = config.minTravelMs;
+  if (!detector.baselinePulseMs &&
+      detector.widthCount >= SPEED_BASELINE_WARMUP && pulseMs) {
+    detector.baselinePulseMs = pulseMs;
+    detector.baselineSpeedScale = expectedFreshStartScaleLocked(now);
+    detector.speedScale = detector.baselineSpeedScale;
+  }
+
+  if (detector.baselinePulseMs && pulseMs) {
+    float target = detector.baselineSpeedScale *
+                   static_cast<float>(detector.baselinePulseMs) / pulseMs;
+    if (target < 1.0f) target = 1.0f;
+
+    float physicalMax =
+        static_cast<float>(config.travelMs) / config.minTravelMs;
+    float chromeMax = CHROME_MAX_SPEED / CHROME_START_SPEED;
+    float maxScale = physicalMax < chromeMax ? physicalMax : chromeMax;
+    if (target > maxScale) target = maxScale;
+
+    // The game only accelerates. Ignore apparent slowdowns from cactus-width
+    // variation and limit each upward correction so one pulse cannot jump the
+    // timing model too far.
+    if (target > detector.speedScale) {
+      float step = detector.speedScale * config.adaptStepPct / 100.0f;
+      if (step < 0.01f) step = 0.01f;
+      float next = detector.speedScale + step;
+      detector.speedScale = target < next ? target : next;
+    }
+  }
+
+  uint32_t travel = static_cast<uint32_t>(
+      config.travelMs / detector.speedScale + 0.5f);
+  if (travel < config.minTravelMs) travel = config.minTravelMs;
+  detector.travelMs = travel;
+
+  uint32_t gap = static_cast<uint32_t>(
+      config.gapMs / detector.speedScale + 0.5f);
+  uint32_t minGap = config.sampleMs * 3;
+  detector.gapMs = gap > minGap ? gap : minGap;
 }
 
 float estimateWidthLocked(uint32_t pulseMs, uint32_t referenceMs) {
@@ -506,12 +561,11 @@ void finalizeEnvelopeLocked(uint64_t now) {
   pushWidthPulseLocked(pulseMs);
 
   uint32_t referenceMs = widthReferenceLocked();
+  updateSpeedLocked(speedReferenceLocked(), now);
+
   float widthEstimate = estimateWidthLocked(pulseMs, referenceMs);
   bool longJump = detector.widthCount < CLASSIFY_WARMUP ||
                   widthEstimate >= config.longAtWidths;
-
-  // Wide groups must not pollute the speed estimator.
-  if (!longJump) updateTravelLocked(pulseMs);
 
   // The optical footprint is fixed. Estimate its crossing time from recent
   // single-cactus pulses instead of scaling correction with a wide group.
@@ -559,12 +613,14 @@ void finalizeEnvelopeLocked(uint64_t now) {
     detector.lastCommandMs = executeAt;
     detector.lastLandingMs = executeAt + config.actuatorMs + airMs;
     detector.hasPlan = true;
-    queueLog("[PLAN] #%lu %s width=%.2f pulse=%lu hold=%lu air=%lu cmd-in=%lld late=%llu %s",
+    queueLog("[PLAN] #%lu %s width=%.2f speed=x%.2f pulse=%lu travel=%lu gap=%lu hold=%lu cmd-in=%lld late=%llu %s",
              static_cast<unsigned long>(detector.plannedJumps),
              longJump ? "LONG" : "SHORT", widthEstimate,
+             detector.speedScale,
              static_cast<unsigned long>(pulseMs),
+             static_cast<unsigned long>(detector.travelMs),
+             static_cast<unsigned long>(detector.gapMs),
              static_cast<unsigned long>(holdMs),
-             static_cast<unsigned long>(airMs),
              static_cast<long long>(static_cast<int64_t>(executeAt) - static_cast<int64_t>(now)),
              static_cast<unsigned long long>(lateMs), reason);
   }
@@ -613,7 +669,7 @@ void sensorTask(void *) {
       if (obstacle) {
         if (!detector.active) { detector.active = true; detector.startMs = now; }
         detector.lastObstacleMs = now;
-      } else if (detector.active && now - detector.lastObstacleMs >= config.gapMs) {
+      } else if (detector.active && now - detector.lastObstacleMs >= detector.gapMs) {
         finalizeEnvelopeLocked(now);
       }
     }
@@ -642,7 +698,7 @@ void printManual() {
   Serial.println("threshold rest press hold longhold air longair longat");
   Serial.println("actuator travel mintravel landing clearance gap sample cooldown rearm");
   Serial.println("ratio adapt adaptstep debug");
-  Serial.println("Example: longhold 160   longair 520   longat 1.60\n");
+  Serial.println("Acceleration: adapt on scales travel + gap from measured speed\n");
 }
 
 void printStatus() {
@@ -650,7 +706,11 @@ void printStatus() {
   int adc = readSensor();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   float ratio = sensorRatio;
+  float speed = detector.speedScale;
   uint32_t effective = detector.travelMs;
+  uint32_t effectiveGap = detector.gapMs;
+  uint32_t speedRef = speedReferenceLocked();
+  uint32_t baseline = detector.baselinePulseMs;
   bool bg = backgroundIsWhite;
   uint32_t ref = widthReferenceLocked();
   xSemaphoreGive(stateMutex);
@@ -665,23 +725,29 @@ void printStatus() {
                 static_cast<unsigned long>(cfg.longHoldMs), static_cast<unsigned long>(cfg.longAirMs));
   Serial.printf("Long jump: width >= %.2f cactus-widths | pulse reference=%lu ms\n",
                 cfg.longAtWidths, static_cast<unsigned long>(ref));
-  Serial.printf("Timing: actuator=%lu travel=%lu effective=%lu landing=%lu clearance=%lu\n",
-                static_cast<unsigned long>(cfg.actuatorMs), static_cast<unsigned long>(cfg.travelMs),
-                static_cast<unsigned long>(effective), static_cast<unsigned long>(cfg.landingMs),
+  Serial.printf("Speed: x%.2f | baseline-pulse=%lu current-pulse=%lu | adapt=%s step=%.1f%%\n",
+                speed, static_cast<unsigned long>(baseline),
+                static_cast<unsigned long>(speedRef), onOff(cfg.adapt), cfg.adaptStepPct);
+  Serial.printf("Timing: actuator=%lu travel=%lu->%lu gap=%lu->%lu landing=%lu clearance=%lu\n",
+                static_cast<unsigned long>(cfg.actuatorMs),
+                static_cast<unsigned long>(cfg.travelMs), static_cast<unsigned long>(effective),
+                static_cast<unsigned long>(cfg.gapMs), static_cast<unsigned long>(effectiveGap),
+                static_cast<unsigned long>(cfg.landingMs),
                 static_cast<unsigned long>(cfg.clearanceMs));
-  Serial.printf("Sensor: sample=%lu gap=%lu ratio=%.2f:1 hysteresis=%d\n",
-                static_cast<unsigned long>(cfg.sampleMs), static_cast<unsigned long>(cfg.gapMs),
-                ratio, SENSOR_HYSTERESIS);
-  Serial.printf("Adapt=%s mintravel=%lu step=%.1f%% | debug=%s | flash=%s\n",
-                onOff(cfg.adapt), static_cast<unsigned long>(cfg.minTravelMs),
-                cfg.adaptStepPct, onOff(cfg.debug), prefsReady ? "ready" : "unavailable");
+  Serial.printf("Sensor: sample=%lu ratio=%.2f:1 hysteresis=%d | debug=%s | flash=%s\n",
+                static_cast<unsigned long>(cfg.sampleMs), ratio, SENSOR_HYSTERESIS,
+                onOff(cfg.debug), prefsReady ? "ready" : "unavailable");
 }
 
 void startAutoplay(bool clickToStart) {
   chooseBackground();
+  uint64_t now = nowMs();
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   ++playGeneration;
   resetTimingLocked();
+  detector.freshStart = clickToStart;
+  detector.gameStartMs = now + (clickToStart ? config.actuatorMs : 0);
   playing = true;
   bool bg = backgroundIsWhite;
   int adc = lastSensorValue;
@@ -689,7 +755,10 @@ void startAutoplay(bool clickToStart) {
   clearClickQueue();
 
   Serial.printf("[START] Armed. Background=%s sensor=%d.\n", colorName(bg), adc);
-  if (clickToStart && queueClick(nowMs(), true, false)) Serial.println("[START] Initial short click queued.");
+  if (clickToStart && queueClick(now, true, false))
+    Serial.println("[START] Initial short click queued.");
+  else if (!clickToStart)
+    Serial.println("[START] Arm mode: speed scaling is relative to the current game speed.");
 }
 
 void stopAutoplay() {
@@ -765,7 +834,8 @@ SetResult setParameter(String rawName, String value) {
       config.*(s.field) = static_cast<uint32_t>(number);
       changed = true;
       resetTiming = name == "travel" || name == "travelms" ||
-                    name == "mintravel" || name == "mintravelms";
+                    name == "mintravel" || name == "mintravelms" ||
+                    name == "gap" || name == "gapms";
       break;
     }
   }
@@ -914,7 +984,7 @@ void setup() {
     fatal("[FATAL] Could not create FreeRTOS tasks.");
   }
 
-  Serial.println("\nDino ESP32 Auto-Player ready (short + long jumps).");
+  Serial.println("\nDino ESP32 Auto-Player ready (dual jumps + speed scaling).");
   Serial.println("Runtime: sensor task + servo task + serial task. loop() stays idle.");
   printStatus();
   printManual();
