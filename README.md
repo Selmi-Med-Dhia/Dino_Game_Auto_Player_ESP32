@@ -2,84 +2,85 @@
 
 ESP32 hardware auto-player for Chrome Dino using one analog light sensor and one servo.
 
-- **Servo:** GPIO 18
-- **Light sensor:** analog GPIO 15
-- **White:** ADC > 200
-- **Black:** ADC < 200
-- **Servo rest / press:** 35° / 38°
-- **Serial:** 115200 baud
+- Servo: GPIO 18
+- Light sensor: analog GPIO 15
+- Serial: 115200 baud
+- Servo rest / press: 35° / 38°
+- Runtime: FreeRTOS tasks only; `loop()` stays idle
 
-The runtime uses FreeRTOS tasks. `loop()` stays idle.
+## Default behavior
 
-## Current behavior
+The firmware is now **armed automatically after every ESP32 boot/reset**.
 
-The firmware now handles three things automatically:
+You do not need to type `arm`.
 
-1. **SHORT jump** for a normal/small obstacle.
-2. **LONG jump** for a wide cactus group.
-3. **Game acceleration** by scaling horizontal timing as Chrome gets faster.
-
-Your existing jump calibration remains the base calibration:
+After boot, it waits for the next cactus. When that first cactus finishes passing the sensor:
 
 ```text
-SHORT: hold 80 ms   air 450 ms
-LONG:  hold 160 ms  air 520 ms
+round time = 0
 ```
 
-The servo angles, hold times and vertical jump airtimes are **not** scaled with game speed. Chrome's acceleration changes horizontal scrolling speed; it does not make the servo or the Dino's vertical jump physics run proportionally faster.
+That same first cactus is still handled normally. From then on, acceleration is calculated only from elapsed round time.
 
-The values that do scale are:
+If you reset the ESP32 in the middle of a Dino run, the round clock is cleared. The next cactus becomes the new `t = 0`.
+
+## Acceleration model
+
+Acceleration no longer depends on how long a cactus stays under the sensor.
+
+That approach is unsuitable because single, double and triple cactus groups have different optical pulse widths.
+
+The firmware now uses a deterministic Chrome-Dino-style speed curve:
 
 ```text
-travel   sensor -> Dino travel time
-gap      optical clear-gap used to finish an obstacle envelope
+speed = 6.0 + 0.060 * round_seconds
+maximum speed = 13.0
 ```
 
-Example:
+The first cactus after boot/reset is the reference point (`speed x1.00`).
+
+Only timings related to horizontal screen motion are scaled:
 
 ```text
-speed x1.00 -> travel 1550 ms, gap 40 ms
-speed x1.50 -> travel ~1033 ms, gap ~27 ms
-speed x2.00 -> travel ~775 ms,  gap ~20 ms
+effective travel = configured travel / speed factor
+effective gap    = configured gap / speed factor
 ```
 
-## Acceleration tracking
-
-Chrome normal mode starts around speed `6`, accelerates continuously, and caps around speed `13`.
-
-The ESP32 does not simply assume elapsed time is perfect. It uses the light sensor:
-
-1. Collect recent optical obstacle pulses.
-2. Use the small-pulse reference as a speed signal.
-3. Learn a baseline after the first few obstacles.
-4. Compare the current reference pulse with that baseline.
-5. A shorter pulse means the screen is moving faster.
-6. Scale `travel` and `gap` by the resulting speed factor.
-
-When the run was started with `start`, the firmware also compensates for the small amount of Chrome acceleration that happened while the initial optical baseline was being learned. After that, pulse timing drives the scale.
-
-`adaptstep` limits how much the estimate can increase from one obstacle to the next so one noisy pulse cannot suddenly change the timing.
-
-Defaults:
+The physical jump calibration does **not** scale:
 
 ```text
-adapt on
-adaptstep 3
+SHORT hold = 80 ms
+LONG  hold = 160 ms
+SHORT air  = 450 ms
+LONG  air  = 520 ms
+servo angles stay unchanged
 ```
 
-For a normal run, prefer:
+With the default `travel 1550` and `gap 40`:
 
-```text
-start
-```
+| Round time | Speed factor | Travel | Gap |
+|---:|---:|---:|---:|
+| 0 s | x1.00 | 1550 ms | 40 ms |
+| 15 s | x1.15 | 1348 ms | 35 ms |
+| 30 s | x1.30 | 1192 ms | 31 ms |
+| 60 s | x1.60 | 969 ms | 25 ms |
+| 90 s | x1.90 | 816 ms | 21 ms |
+| ~117 s+ | x2.17 | ~715 ms | ~18 ms |
 
-rather than `arm`, because `start` gives the ESP32 a known game start point. `arm` still adapts, but its speed scale is relative to the speed at which it was armed.
+`mintravel` still limits how low travel can go.
 
 ## Short and long jumps
 
-The sensor footprint is approximately **2× one normal cactus width**.
+The existing dual-jump behavior is unchanged.
 
-The firmware estimates the fixed optical footprint and then estimates the actual obstacle/group width.
+```text
+SHORT: hold 80 ms, modeled air 450 ms
+LONG:  hold 160 ms, modeled air 520 ms
+```
+
+The optical sensor footprint is approximately 2× a normal cactus width. The firmware keeps a recent pulse history only for estimating obstacle/group width and selecting SHORT vs LONG.
+
+Pulse duration is **not used for speed anymore**.
 
 Default:
 
@@ -88,91 +89,98 @@ ratio 2.0
 longat 1.60
 ```
 
-Approximately:
-
-```text
-width ~1.0 -> SHORT
-width >=1.60 -> LONG
-```
-
-Manual tests:
-
-```text
-click
-longclick
-```
-
-## FreeRTOS tasks
-
-| Task | Core | Priority | Job |
-|---|---:|---:|---|
-| Servo | 1 | 5 | Executes scheduled key presses |
-| Sensor / planner | 0 | 4 | ADC sampling, filtering, width/speed estimation and planning |
-| Serial | 0 | 2 | Commands, configuration and runtime logs |
-
-The sensor and servo tasks do not print directly to Serial. Runtime logs are queued for the serial task so UART output cannot block obstacle detection.
-
 ## Serial Monitor
 
-### PlatformIO / VS Code
+PlatformIO / VS Code:
 
-1. Connect the ESP32 over USB.
-2. Open the project in VS Code with PlatformIO.
-3. Upload the firmware.
-4. Open **PlatformIO → Project Tasks → upesy_wroom → Monitor**.
-5. Baud is already configured to **115200**.
-6. Click the terminal, type a command and press **Enter**.
+1. Connect the ESP32.
+2. Upload the firmware.
+3. Open **PlatformIO → Project Tasks → upesy_wroom → Monitor**.
+4. Use 115200 baud.
+5. Type a command and press Enter.
 
-### Arduino IDE
+Arduino IDE:
 
-Open **Tools → Serial Monitor** and select:
+1. Open **Tools → Serial Monitor**.
+2. Set **115200 baud**.
+3. Select **New Line** or **Both NL & CR**.
 
-```text
-Baud: 115200
-Line ending: New Line
-```
+The firmware prints the command reminder after every command.
 
-`Both NL & CR` also works.
-
-The firmware prints the short command manual again after every command.
-
-## Main commands
+## Commands
 
 ```text
-start
-arm
-stop
+start | arm | stop | click | longclick | show | sensor | reset | defaults
+theme auto|light|dark
 
-click
-longclick
-
-show
-sensor
-reset
-defaults
-
-theme auto
-theme light
-theme dark
+threshold rest press hold longhold air longair longat
+actuator travel mintravel landing clearance gap sample cooldown rearm
+ratio adapt debug
 ```
 
-Change settings directly:
+Old `set ...` syntax still works.
+
+### Important commands
+
+`show`
+
+Shows current round state, elapsed time, speed factor and effective timing.
+
+`reset`
+
+Resets the round clock and learned width history while keeping autoplay armed and preserving all saved configuration.
 
 ```text
-travel 1550
-ratio 2.0
-longat 1.60
-adapt on
-adaptstep 3
+[RESET] Round reset. Autoplay remains armed; the next cactus becomes t=0.
 ```
 
-Old syntax such as this still works:
+`start`
+
+Resets the round and sends one short servo click to start/restart Dino. The first cactus after that click becomes round `t = 0`.
+
+`arm`
+
+Resets the round without pressing the key. Usually unnecessary because the firmware auto-arms on boot.
+
+`stop`
+
+Stops automatic play.
+
+`adapt on`
+
+Enables round-time acceleration scaling.
+
+`adapt off`
+
+Keeps `travel` and `gap` fixed.
+
+## Debug output
+
+Recommended:
 
 ```text
-set travel_ms 1550
+debug on
 ```
 
-## Recommended configuration
+A planned jump now looks like:
+
+```text
+[PLAN] #12 SHORT width=1.05 round=43.2s speed=x1.43 travel=1084 gap=28 hold=80 cmd-in=220 late=0 exit-aligned
+```
+
+Useful fields:
+
+- `round` — seconds since the first cactus passed.
+- `speed` — deterministic round-time speed factor.
+- `travel` — current scaled sensor-to-Dino timing.
+- `gap` — current scaled obstacle-envelope gap.
+- `SHORT` / `LONG` — selected jump type.
+- `width` — estimated obstacle/group width.
+- `late` — scheduling lateness.
+
+For a normal run, `speed` should rise steadily with time even if every obstacle is a different cactus group.
+
+## Current starting configuration
 
 ```text
 threshold 200
@@ -196,115 +204,27 @@ sample 5
 ratio 2.0
 
 adapt on
-adaptstep 3
 ```
 
-All configuration changes are saved to ESP32 NVS immediately.
+All changed settings are saved immediately in ESP32 NVS.
 
-## Watching acceleration
+## Notes on `adaptstep`
 
-Use:
+`adaptstep` remains in the saved v3 configuration for backward compatibility, but timed acceleration does not use per-obstacle adaptation anymore. Existing NVS data therefore remains compatible without being erased.
 
-```text
-debug on
-start
-```
+## FreeRTOS tasks
 
-A planner line now includes the measured speed factor and scaled timing:
+| Task | Core | Priority | Job |
+|---|---:|---:|---|
+| Servo | 1 | 5 | Executes scheduled short/long key presses |
+| Sensor / planner | 0 | 4 | Samples sensor, tracks round clock, classifies obstacles, plans jumps |
+| Serial | 0 | 2 | Commands and queued runtime logs |
 
-```text
-[PLAN] #12 SHORT width=1.04 speed=x1.37 pulse=105 travel=1131 gap=29 hold=80 cmd-in=245 late=0 exit-aligned
-```
+Sensor and servo tasks never print directly to Serial.
 
-Later in the same run you might see:
+## Rollback
 
-```text
-[PLAN] #31 LONG width=2.08 speed=x1.82 pulse=86 travel=852 gap=22 hold=160 cmd-in=126 late=0 exit-aligned
-```
-
-Important fields:
-
-- `SHORT` / `LONG` — selected jump.
-- `width` — estimated obstacle width.
-- `speed=x...` — measured relative game speed.
-- `travel` — current scaled sensor-to-Dino time.
-- `gap` — current scaled envelope finalization gap.
-- `hold` — actual servo hold used for that jump.
-- `late` — whether the ideal command time was already missed.
-
-Run:
-
-```text
-show
-```
-
-to see the current speed estimate and base/effective timing.
-
-## Tuning acceleration
-
-Normally leave:
-
-```text
-adapt on
-adaptstep 3
-```
-
-If acceleration correction visibly lags behind the game, try:
-
-```text
-adaptstep 4
-```
-
-or:
-
-```text
-adaptstep 5
-```
-
-Do not immediately use very large values. The pulse history already filters cactus-width variation; `adaptstep` is a second safety limit.
-
-If you want to temporarily compare against the old fixed-speed behavior:
-
-```text
-adapt off
-reset
-```
-
-Then turn it back on:
-
-```text
-adapt on
-reset
-```
-
-`reset` clears learned width/speed history but keeps saved settings.
-
-## General timing calibration
-
-Your base `travel` is still the timing at approximately the beginning of a run.
-
-- All jumps too late near the **start**: decrease `travel` in 20–40 ms steps.
-- All jumps too early near the **start**: increase `travel`.
-- Start is good but later game becomes late: increase `adaptstep` slightly.
-- Start is good but later game becomes too early: decrease `adaptstep`.
-- Servo physically reaches the key later than modeled: increase `actuator`.
-- A wide group gets SHORT: lower `longat` slightly.
-- Too many single cacti get LONG: raise `longat`.
-- A long jump is physically too short: increase `longhold`.
-- Repeated `late > 0`: check sensor position, `travel`, `actuator`, and whether speed scaling is learning correctly.
-
-## Persistent configuration
-
-Settings are stored using ESP32 `Preferences` / NVS.
-
-- Power loss keeps configuration.
-- `reset` only clears runtime learning.
-- `defaults` restores firmware defaults and saves them.
-- Existing v3 calibration is preserved by this acceleration update.
-
-## Rollback point
-
-The last confirmed working firmware before acceleration scaling is preserved at:
+The previously working pre-acceleration version remains preserved on branch:
 
 ```text
 working-without-acceleration
@@ -318,6 +238,6 @@ d976f2a79c45c9dc18495b80f0875f7248376cbf
 
 ## Hardware notes
 
-- GPIO 15 is an ESP32 ADC2/strapping pin. Wi-Fi is not used here.
-- Make sure the sensor circuit does not force an invalid boot strap level during reset.
-- Use a suitable external supply for the servo when necessary and connect grounds together.
+GPIO 15 is an ESP32 ADC2/strapping pin. This project does not use Wi-Fi. Make sure the sensor circuit does not force an invalid boot strap level during reset.
+
+Power anything larger than a tiny servo from a suitable external supply and connect the grounds together.
