@@ -18,21 +18,17 @@ constexpr size_t CLICK_QUEUE_SIZE = 12;
 constexpr size_t LOG_QUEUE_SIZE = 16;
 constexpr size_t WIDTH_HISTORY_SIZE = 15;
 constexpr size_t CLASSIFY_WARMUP = 4;
-constexpr size_t SPEED_BASELINE_WARMUP = 10;
 constexpr float DEFAULT_SENSOR_RATIO = 2.0f;
 
-// Chrome normal mode starts at 6, accelerates by about 0.001 per frame,
-// and caps at 13. This is only used to compensate the short learning warmup;
-// optical pulse timing drives the speed estimate after that.
-constexpr float CHROME_START_SPEED = 6.0f;
-constexpr float CHROME_MAX_SPEED = 13.0f;
-constexpr float CHROME_ACCEL_PER_SECOND = 0.060f;
+constexpr float ROUND_START_SPEED = 6.0f;
+constexpr float ROUND_MAX_SPEED = 13.0f;
+constexpr float ROUND_ACCEL_PER_SECOND = 0.060f;
+
 constexpr uint32_t CONFIG_MAGIC = 0xD1A02026;
 constexpr uint16_t CONFIG_VERSION = 3;
 
 enum class ThemeMode : uint8_t { Auto, Light, Dark };
 
-// Exact layout used by firmware v1/v2 so existing saved calibration survives.
 struct LegacyConfig {
   uint32_t magic;
   uint16_t version;
@@ -63,16 +59,11 @@ struct Config {
   int threshold = 200;
   int restAngle = 35;
   int pressAngle = 38;
-
-  // Short jump: current working calibration.
   uint32_t holdMs = 80;
   uint32_t airMs = 450;
-
-  // Long jump: hold Space until Chrome Dino reaches its full jump arc.
   uint32_t longHoldMs = 160;
   uint32_t longAirMs = 520;
   float longAtWidths = 1.60f;
-
   uint32_t actuatorMs = 160;
   uint32_t travelMs = 1550;
   uint32_t minTravelMs = 350;
@@ -107,23 +98,18 @@ struct Detector {
   uint64_t lastLandingMs = 0;
   uint64_t lastCommandMs = 0;
   bool hasPlan = false;
-  uint32_t travelMs = 0;
-
   uint32_t widthHistory[WIDTH_HISTORY_SIZE] = {};
   size_t widthCount = 0;
   size_t widthIndex = 0;
-
-  uint32_t baselinePulseMs = 0;
-  float baselineSpeedScale = 1.0f;
+  bool roundStarted = false;
+  uint64_t roundStartMs = 0;
   float speedScale = 1.0f;
+  uint32_t travelMs = 0;
   uint32_t gapMs = 0;
-
-  bool freshStart = false;
-  uint64_t gameStartMs = 0;
   uint32_t plannedJumps = 0;
 };
 
-struct LogMessage { char text[160]; };
+struct LogMessage { char text[176]; };
 
 struct UIntSetting {
   const char *name;
@@ -222,8 +208,6 @@ void queueLog(const char *format, ...) {
   xQueueSend(logQueue, &message, 0);
 }
 
-// Persistent configuration -------------------------------------------------
-
 bool configValid(const Config &c) {
   return c.magic == CONFIG_MAGIC && c.version == CONFIG_VERSION &&
          c.threshold >= 0 && c.threshold <= 4095 &&
@@ -273,8 +257,6 @@ void migrateLegacy(const LegacyConfig &old) {
   config.adaptStepPct = old.adaptStepPct;
   config.theme = old.theme;
   config.debug = old.debug;
-
-  // Apply the v1->v2 calibration improvements only when loading v1.
   if (old.version == 1) {
     if (config.sampleMs == 2) config.sampleMs = 5;
     if (config.gapMs == 120) config.gapMs = 40;
@@ -298,36 +280,27 @@ void loadConfig() {
     Serial.println("[NVS] Flash unavailable; using defaults.");
     return;
   }
-
   size_t bytes = prefs.getBytesLength("config");
   bool migrated = false;
-
   if (bytes == sizeof(Config)) {
     prefs.getBytes("config", &config, sizeof(config));
   } else if (bytes == sizeof(LegacyConfig)) {
     LegacyConfig old{};
     prefs.getBytes("config", &old, sizeof(old));
-    if (legacyValid(old)) {
-      migrateLegacy(old);
-      migrated = true;
-    }
+    if (legacyValid(old)) { migrateLegacy(old); migrated = true; }
   }
-
   if (!configValid(config)) {
     config = Config{};
     Serial.println("[NVS] Defaults loaded.");
   } else if (migrated) {
-    Serial.println("[NVS] Existing calibration migrated; dual-jump defaults added.");
+    Serial.println("[NVS] Existing calibration migrated.");
   } else {
     Serial.println("[NVS] Saved configuration loaded.");
   }
   prefs.putBytes("config", &config, sizeof(config));
-
   sensorRatio = prefs.getFloat("ratio", DEFAULT_SENSOR_RATIO);
   if (sensorRatio < 0.5f || sensorRatio > 6.0f) sensorRatio = DEFAULT_SENSOR_RATIO;
 }
-
-// Sensor and timing model --------------------------------------------------
 
 int readSensor() { return analogRead(SENSOR_PIN); }
 
@@ -350,10 +323,40 @@ void resetEnvelopeLocked() {
   detector.oppositeSinceMs = 0;
 }
 
-void resetTimingLocked() {
+void resetRoundLocked() {
   detector = Detector{};
   detector.travelMs = config.travelMs;
   detector.gapMs = config.gapMs;
+}
+
+void updateRoundTimingLocked(uint64_t now) {
+  float scale = 1.0f;
+  if (config.adapt && detector.roundStarted && now > detector.roundStartMs) {
+    float elapsedS = static_cast<float>(now - detector.roundStartMs) / 1000.0f;
+    float speed = ROUND_START_SPEED + ROUND_ACCEL_PER_SECOND * elapsedS;
+    if (speed > ROUND_MAX_SPEED) speed = ROUND_MAX_SPEED;
+    scale = speed / ROUND_START_SPEED;
+  }
+  detector.speedScale = scale;
+  uint32_t travel = static_cast<uint32_t>(config.travelMs / scale + 0.5f);
+  if (travel < config.minTravelMs) travel = config.minTravelMs;
+  detector.travelMs = travel;
+  uint32_t gap = static_cast<uint32_t>(config.gapMs / scale + 0.5f);
+  uint32_t minGap = config.sampleMs * 3;
+  detector.gapMs = gap > minGap ? gap : minGap;
+}
+
+void startRoundLocked(uint64_t firstCactusExitMs) {
+  if (detector.roundStarted) return;
+  detector.roundStarted = true;
+  detector.roundStartMs = firstCactusExitMs;
+  updateRoundTimingLocked(firstCactusExitMs);
+}
+
+uint32_t roundElapsedMsLocked(uint64_t now) {
+  if (!detector.roundStarted || now <= detector.roundStartMs) return 0;
+  uint64_t elapsed = now - detector.roundStartMs;
+  return elapsed > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed);
 }
 
 void pushWidthPulseLocked(uint32_t pulseMs) {
@@ -372,96 +375,13 @@ uint32_t widthReferenceLocked() {
     while (j && values[j - 1] > v) { values[j] = values[j - 1]; --j; }
     values[j] = v;
   }
-  size_t index = detector.widthCount >= 3 ? 2 : detector.widthCount - 1; // third-smallest
+  size_t index = detector.widthCount >= 3 ? 2 : detector.widthCount - 1;
   return values[index];
-}
-
-uint32_t speedReferenceLocked() {
-  if (!detector.widthCount) return 0;
-
-  uint32_t values[WIDTH_HISTORY_SIZE];
-  for (size_t i = 0; i < detector.widthCount; ++i)
-    values[i] = detector.widthHistory[i];
-
-  for (size_t i = 1; i < detector.widthCount; ++i) {
-    uint32_t v = values[i];
-    size_t j = i;
-    while (j && values[j - 1] > v) {
-      values[j] = values[j - 1];
-      --j;
-    }
-    values[j] = v;
-  }
-
-  // Second-smallest pulse reacts to acceleration quickly while ignoring most
-  // wide cactus groups. Width classification keeps its existing third-smallest
-  // reference, so the working SHORT/LONG behavior is unchanged.
-  size_t index = detector.widthCount >= 2 ? 1 : 0;
-  return values[index];
-}
-
-float expectedFreshStartScaleLocked(uint64_t now) {
-  if (!detector.freshStart || now <= detector.gameStartMs) return 1.0f;
-
-  float elapsedS =
-      static_cast<float>(now - detector.gameStartMs) / 1000.0f;
-  float speed = CHROME_START_SPEED + CHROME_ACCEL_PER_SECOND * elapsedS;
-  if (speed > CHROME_MAX_SPEED) speed = CHROME_MAX_SPEED;
-  return speed / CHROME_START_SPEED;
-}
-
-void updateSpeedLocked(uint32_t pulseMs, uint64_t now) {
-  if (!config.adapt) {
-    detector.speedScale = 1.0f;
-    detector.travelMs = config.travelMs;
-    detector.gapMs = config.gapMs;
-    return;
-  }
-
-  if (!detector.baselinePulseMs &&
-      detector.widthCount >= SPEED_BASELINE_WARMUP && pulseMs) {
-    detector.baselinePulseMs = pulseMs;
-    detector.baselineSpeedScale = expectedFreshStartScaleLocked(now);
-    detector.speedScale = detector.baselineSpeedScale;
-  }
-
-  if (detector.baselinePulseMs && pulseMs) {
-    float target = detector.baselineSpeedScale *
-                   static_cast<float>(detector.baselinePulseMs) / pulseMs;
-    if (target < 1.0f) target = 1.0f;
-
-    float physicalMax =
-        static_cast<float>(config.travelMs) / config.minTravelMs;
-    float chromeMax = CHROME_MAX_SPEED / CHROME_START_SPEED;
-    float maxScale = physicalMax < chromeMax ? physicalMax : chromeMax;
-    if (target > maxScale) target = maxScale;
-
-    // The game only accelerates. Ignore apparent slowdowns from cactus-width
-    // variation and limit each upward correction so one pulse cannot jump the
-    // timing model too far.
-    if (target > detector.speedScale) {
-      float step = detector.speedScale * config.adaptStepPct / 100.0f;
-      if (step < 0.01f) step = 0.01f;
-      float next = detector.speedScale + step;
-      detector.speedScale = target < next ? target : next;
-    }
-  }
-
-  uint32_t travel = static_cast<uint32_t>(
-      config.travelMs / detector.speedScale + 0.5f);
-  if (travel < config.minTravelMs) travel = config.minTravelMs;
-  detector.travelMs = travel;
-
-  uint32_t gap = static_cast<uint32_t>(
-      config.gapMs / detector.speedScale + 0.5f);
-  uint32_t minGap = config.sampleMs * 3;
-  detector.gapMs = gap > minGap ? gap : minGap;
 }
 
 float estimateWidthLocked(uint32_t pulseMs, uint32_t referenceMs) {
   if (!referenceMs || detector.widthCount < CLASSIFY_WARMUP) return 1.0f;
-  float r = sensorRatio;
-  float cactusMs = referenceMs / (r + 1.0f);
+  float cactusMs = referenceMs / (sensorRatio + 1.0f);
   float sensorMs = referenceMs - cactusMs;
   if (cactusMs < 1.0f) return 1.0f;
   float widths = (pulseMs - sensorMs) / cactusMs;
@@ -474,8 +394,7 @@ void clearClickQueue() {
 }
 
 bool queueClick(uint64_t atMs, bool manual, uint32_t holdMs, const Config &cfg) {
-  ClickCommand cmd{atMs, playGeneration, cfg.pressAngle, cfg.restAngle,
-                   holdMs, manual, cfg.debug};
+  ClickCommand cmd{atMs, playGeneration, cfg.pressAngle, cfg.restAngle, holdMs, manual, cfg.debug};
   if (xQueueSend(clickQueue, &cmd, 0) == pdTRUE) return true;
   queueLog("[WARN] Servo queue full; click dropped.");
   return false;
@@ -506,12 +425,9 @@ void prunePending(ClickCommand *pending, size_t &count) {
   count = out;
 }
 
-// Servo task ---------------------------------------------------------------
-
 void servoTask(void *) {
   ClickCommand pending[CLICK_QUEUE_SIZE]{};
   size_t count = 0;
-
   for (;;) {
     prunePending(pending, count);
     TickType_t wait = portMAX_DELAY;
@@ -520,25 +436,21 @@ void servoTask(void *) {
       uint64_t ms = pending[0].atMs > now ? pending[0].atMs - now : 0;
       wait = ms ? pdMS_TO_TICKS(static_cast<uint32_t>(ms)) : 0;
     }
-
     ClickCommand incoming{};
     if (xQueueReceive(clickQueue, &incoming, wait) == pdTRUE) {
       insertPending(pending, count, incoming);
       continue;
     }
     if (!count) continue;
-
     ClickCommand cmd = pending[0];
     for (size_t i = 1; i < count; ++i) pending[i - 1] = pending[i];
     --count;
     if (!cmd.manual && (!playing || cmd.generation != playGeneration)) continue;
-
     uint64_t actual = nowMs();
     servo.write(cmd.pressAngle);
     TickType_t hold = pdMS_TO_TICKS(cmd.holdMs);
     vTaskDelay(hold ? hold : 1);
     servo.write(cmd.restAngle);
-
     if (cmd.debug) {
       uint64_t late = actual > cmd.atMs ? actual - cmd.atMs : 0;
       queueLog("[CLICK] hold=%lu task-late=%llu ms",
@@ -548,76 +460,60 @@ void servoTask(void *) {
   }
 }
 
-// Obstacle classification and planning ------------------------------------
-
 void finalizeEnvelopeLocked(uint64_t now) {
   if (!detector.active || detector.lastObstacleMs < detector.startMs) {
     resetEnvelopeLocked();
     return;
   }
-
   uint32_t pulseMs = static_cast<uint32_t>(detector.lastObstacleMs - detector.startMs);
   if (!pulseMs) pulseMs = 1;
+  startRoundLocked(detector.lastObstacleMs);
+  updateRoundTimingLocked(now);
   pushWidthPulseLocked(pulseMs);
-
   uint32_t referenceMs = widthReferenceLocked();
-  updateSpeedLocked(speedReferenceLocked(), now);
-
   float widthEstimate = estimateWidthLocked(pulseMs, referenceMs);
-  bool longJump = detector.widthCount < CLASSIFY_WARMUP ||
-                  widthEstimate >= config.longAtWidths;
-
-  // The optical footprint is fixed. Estimate its crossing time from recent
-  // single-cactus pulses instead of scaling correction with a wide group.
-  float r = sensorRatio;
+  bool longJump = detector.widthCount < CLASSIFY_WARMUP || widthEstimate >= config.longAtWidths;
   float sensorFootprintMs = referenceMs
-      ? referenceMs * r / (r + 1.0f)
-      : pulseMs * r / (r + 1.0f);
+      ? referenceMs * sensorRatio / (sensorRatio + 1.0f)
+      : pulseMs * sensorRatio / (sensorRatio + 1.0f);
   int64_t edgeCorrection = static_cast<int64_t>(sensorFootprintMs * 0.5f);
-
   uint32_t holdMs = longJump ? config.longHoldMs : config.holdMs;
   uint32_t airMs = longJump ? config.longAirMs : config.airMs;
   int64_t entry = static_cast<int64_t>(detector.startMs) + edgeCorrection + detector.travelMs;
   int64_t exit = static_cast<int64_t>(detector.lastObstacleMs) - edgeCorrection + detector.travelMs;
   if (exit < entry) exit = entry;
-
   int64_t exitContact = exit + config.landingMs - airMs;
   int64_t safeContact = entry - config.clearanceMs;
   int64_t commandAt = (exitContact < safeContact ? exitContact : safeContact) - config.actuatorMs;
-
   bool entrySafety = safeContact < exitContact;
   bool delayedLanding = false;
   bool delayedCooldown = false;
   if (detector.hasPlan) {
-    int64_t afterLanding = static_cast<int64_t>(detector.lastLandingMs) +
-                           config.rearmMs - config.actuatorMs;
+    int64_t afterLanding = static_cast<int64_t>(detector.lastLandingMs) + config.rearmMs - config.actuatorMs;
     int64_t afterCooldown = static_cast<int64_t>(detector.lastCommandMs) + config.cooldownMs;
     if (commandAt < afterLanding) { commandAt = afterLanding; delayedLanding = true; }
     if (commandAt < afterCooldown) { commandAt = afterCooldown; delayedCooldown = true; }
   }
-
   uint64_t lateMs = 0;
   if (commandAt < static_cast<int64_t>(now)) {
     lateMs = static_cast<uint64_t>(static_cast<int64_t>(now) - commandAt);
     commandAt = static_cast<int64_t>(now);
   }
-
   const char *reason = lateMs ? "sensor-too-close" :
                        delayedLanding ? "post-landing-rejump" :
                        delayedCooldown ? "cooldown" :
                        entrySafety ? "entry-safety" : "exit-aligned";
   uint64_t executeAt = static_cast<uint64_t>(commandAt);
-
   if (queueClick(executeAt, false, holdMs, config)) {
     ++detector.plannedJumps;
     detector.lastCommandMs = executeAt;
     detector.lastLandingMs = executeAt + config.actuatorMs + airMs;
     detector.hasPlan = true;
-    queueLog("[PLAN] #%lu %s width=%.2f speed=x%.2f pulse=%lu travel=%lu gap=%lu hold=%lu cmd-in=%lld late=%llu %s",
+    uint32_t roundMs = roundElapsedMsLocked(now);
+    queueLog("[PLAN] #%lu %s width=%.2f round=%.1fs speed=x%.2f travel=%lu gap=%lu hold=%lu cmd-in=%lld late=%llu %s",
              static_cast<unsigned long>(detector.plannedJumps),
              longJump ? "LONG" : "SHORT", widthEstimate,
-             detector.speedScale,
-             static_cast<unsigned long>(pulseMs),
+             roundMs / 1000.0f, detector.speedScale,
              static_cast<unsigned long>(detector.travelMs),
              static_cast<unsigned long>(detector.gapMs),
              static_cast<unsigned long>(holdMs),
@@ -627,15 +523,12 @@ void finalizeEnvelopeLocked(uint64_t now) {
   resetEnvelopeLocked();
 }
 
-// Sensor / planner task ----------------------------------------------------
-
 void sensorTask(void *) {
   TickType_t wake = xTaskGetTickCount();
   int first = readSensor();
   int samples[3] = {first, first, first};
   size_t sampleIndex = 0;
   filteredWhite = first > config.threshold;
-
   for (;;) {
     Config cfg = getConfig();
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(cfg.sampleMs));
@@ -645,10 +538,10 @@ void sensorTask(void *) {
     uint64_t now = nowMs();
     bool themeChanged = false;
     bool newBackground = false;
-
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     lastSensorValue = adc;
     filteredWhite = classifyWhite(adc, config.threshold, filteredWhite);
+    updateRoundTimingLocked(now);
     if (playing) {
       bool obstacle = filteredWhite != backgroundIsWhite;
       if (config.theme == ThemeMode::Auto) {
@@ -665,7 +558,6 @@ void sensorTask(void *) {
           detector.oppositeSinceMs = 0;
         }
       }
-
       if (obstacle) {
         if (!detector.active) { detector.active = true; detector.startMs = now; }
         detector.lastObstacleMs = now;
@@ -674,7 +566,6 @@ void sensorTask(void *) {
       }
     }
     xSemaphoreGive(stateMutex);
-
     if (themeChanged) queueLog("[THEME] Background rebased to %s.", colorName(newBackground));
   }
 }
@@ -689,76 +580,69 @@ void chooseBackground() {
   xSemaphoreGive(stateMutex);
 }
 
-// Serial console -----------------------------------------------------------
-
 void printManual() {
   Serial.println("\nstart | arm | stop | click | longclick | show | sensor | reset | defaults");
   Serial.println("theme auto|light|dark");
   Serial.println("<name> <value>  (auto-saved)");
   Serial.println("threshold rest press hold longhold air longair longat");
   Serial.println("actuator travel mintravel landing clearance gap sample cooldown rearm");
-  Serial.println("ratio adapt adaptstep debug");
-  Serial.println("Acceleration: adapt on scales travel + gap from measured speed\n");
+  Serial.println("ratio adapt debug");
+  Serial.println("Round clock: first cactus after boot/reset = t0; adapt on = timed acceleration\n");
 }
 
 void printStatus() {
   Config cfg = getConfig();
   int adc = readSensor();
+  uint64_t now = nowMs();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   float ratio = sensorRatio;
   float speed = detector.speedScale;
-  uint32_t effective = detector.travelMs;
+  uint32_t effectiveTravel = detector.travelMs;
   uint32_t effectiveGap = detector.gapMs;
-  uint32_t speedRef = speedReferenceLocked();
-  uint32_t baseline = detector.baselinePulseMs;
   bool bg = backgroundIsWhite;
+  bool roundStarted = detector.roundStarted;
+  uint32_t roundMs = roundElapsedMsLocked(now);
   uint32_t ref = widthReferenceLocked();
   xSemaphoreGive(stateMutex);
-
   Serial.println("\n=== Dino Auto-Player ===");
-  Serial.printf("Run=%s | sensor=%d (%s) | threshold=%d | background=%s | theme=%s\n",
-                playing ? "ON" : "OFF", adc, colorName(adc > cfg.threshold),
-                cfg.threshold, colorName(bg), themeName(cfg.theme));
+  Serial.printf("Run=%s | round=%s", playing ? "ON" : "OFF",
+                roundStarted ? "RUNNING" : "WAITING FOR FIRST CACTUS");
+  if (roundStarted) Serial.printf(" (%.1f s)", roundMs / 1000.0f);
+  Serial.println();
+  Serial.printf("Sensor=%d (%s) | threshold=%d | background=%s | theme=%s\n",
+                adc, colorName(adc > cfg.threshold), cfg.threshold, colorName(bg), themeName(cfg.theme));
   Serial.printf("Servo: rest=%d press=%d | SHORT hold=%lu air=%lu | LONG hold=%lu air=%lu\n",
                 cfg.restAngle, cfg.pressAngle,
                 static_cast<unsigned long>(cfg.holdMs), static_cast<unsigned long>(cfg.airMs),
                 static_cast<unsigned long>(cfg.longHoldMs), static_cast<unsigned long>(cfg.longAirMs));
   Serial.printf("Long jump: width >= %.2f cactus-widths | pulse reference=%lu ms\n",
                 cfg.longAtWidths, static_cast<unsigned long>(ref));
-  Serial.printf("Speed: x%.2f | baseline-pulse=%lu current-pulse=%lu | adapt=%s step=%.1f%%\n",
-                speed, static_cast<unsigned long>(baseline),
-                static_cast<unsigned long>(speedRef), onOff(cfg.adapt), cfg.adaptStepPct);
-  Serial.printf("Timing: actuator=%lu travel=%lu->%lu gap=%lu->%lu landing=%lu clearance=%lu\n",
-                static_cast<unsigned long>(cfg.actuatorMs),
-                static_cast<unsigned long>(cfg.travelMs), static_cast<unsigned long>(effective),
+  Serial.printf("Acceleration: speed=x%.2f | timed=%s | 6.0 -> 13.0 at +0.060/s\n",
+                speed, onOff(cfg.adapt));
+  Serial.printf("Timing: travel=%lu->%lu gap=%lu->%lu actuator=%lu landing=%lu clearance=%lu\n",
+                static_cast<unsigned long>(cfg.travelMs), static_cast<unsigned long>(effectiveTravel),
                 static_cast<unsigned long>(cfg.gapMs), static_cast<unsigned long>(effectiveGap),
-                static_cast<unsigned long>(cfg.landingMs),
+                static_cast<unsigned long>(cfg.actuatorMs), static_cast<unsigned long>(cfg.landingMs),
                 static_cast<unsigned long>(cfg.clearanceMs));
   Serial.printf("Sensor: sample=%lu ratio=%.2f:1 hysteresis=%d | debug=%s | flash=%s\n",
                 static_cast<unsigned long>(cfg.sampleMs), ratio, SENSOR_HYSTERESIS,
                 onOff(cfg.debug), prefsReady ? "ready" : "unavailable");
 }
 
-void startAutoplay(bool clickToStart) {
+void armFreshRound(bool clickToStart) {
   chooseBackground();
   uint64_t now = nowMs();
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   ++playGeneration;
-  resetTimingLocked();
-  detector.freshStart = clickToStart;
-  detector.gameStartMs = now + (clickToStart ? config.actuatorMs : 0);
+  resetRoundLocked();
   playing = true;
   bool bg = backgroundIsWhite;
   int adc = lastSensorValue;
   xSemaphoreGive(stateMutex);
   clearClickQueue();
-
-  Serial.printf("[START] Armed. Background=%s sensor=%d.\n", colorName(bg), adc);
-  if (clickToStart && queueClick(now, true, false))
-    Serial.println("[START] Initial short click queued.");
-  else if (!clickToStart)
-    Serial.println("[START] Arm mode: speed scaling is relative to the current game speed.");
+  Serial.printf("[ARM] Ready. Round clock will start when the next cactus passes. Background=%s sensor=%d.\n",
+                colorName(bg), adc);
+  if (clickToStart && queueClick(now, true, false)) Serial.println("[START] Initial short click queued.");
 }
 
 void stopAutoplay() {
@@ -778,7 +662,6 @@ enum class SetResult { Changed, Invalid, Unknown };
 SetResult setParameter(String rawName, String value) {
   String name = normalize(rawName);
   long number = 0;
-
   if (name == "ratio") {
     float ratio;
     if (!parseFloatValue(value, ratio) || ratio < 0.5f || ratio > 6.0f) return SetResult::Invalid;
@@ -789,10 +672,8 @@ SetResult setParameter(String rawName, String value) {
     Serial.printf("[SET] ratio = %.2f\n", ratio);
     return SetResult::Changed;
   }
-
-  bool changed = false, resetTiming = false, refreshBackground = false, moveRest = false;
+  bool changed = false, resetRound = false, refreshBackground = false, moveRest = false;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-
   if (name == "threshold" || name == "rest" || name == "press" || name == "clickangle") {
     if (!parseLong(value, number)) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
     if (name == "threshold" && number >= 0 && number <= 4095) config.threshold = number;
@@ -806,22 +687,27 @@ SetResult setParameter(String rawName, String value) {
   } else if (name == "adapt" || name == "debug" || name == "autotheme") {
     bool flag;
     if (!parseBool(value, flag)) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
-    if (name == "adapt") { config.adapt = flag; resetTiming = true; }
+    if (name == "adapt") { config.adapt = flag; resetRound = true; }
     else if (name == "debug") config.debug = flag;
-    else config.theme = flag ? ThemeMode::Auto
-                             : (backgroundIsWhite ? ThemeMode::Light : ThemeMode::Dark);
-    changed = true;
-    refreshBackground = name == "autotheme";
-  } else if (name == "adaptstep" || name == "longat") {
-    float numberFloat;
-    if (!parseFloatValue(value, numberFloat)) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
-    if (name == "adaptstep") {
-      if (numberFloat <= 0 || numberFloat > 20) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
-      config.adaptStepPct = numberFloat;
-    } else {
-      if (numberFloat < 1.1f || numberFloat > 4.0f) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
-      config.longAtWidths = numberFloat;
+    else {
+      config.theme = flag ? ThemeMode::Auto :
+                     (backgroundIsWhite ? ThemeMode::Light : ThemeMode::Dark);
+      refreshBackground = true;
     }
+    changed = true;
+  } else if (name == "longat") {
+    float width;
+    if (!parseFloatValue(value, width) || width < 1.1f || width > 4.0f) {
+      xSemaphoreGive(stateMutex); return SetResult::Invalid;
+    }
+    config.longAtWidths = width;
+    changed = true;
+  } else if (name == "adaptstep") {
+    float f;
+    if (!parseFloatValue(value, f) || f <= 0 || f > 20) {
+      xSemaphoreGive(stateMutex); return SetResult::Invalid;
+    }
+    config.adaptStepPct = f;
     changed = true;
   } else {
     for (const auto &s : UINT_SETTINGS) {
@@ -833,17 +719,15 @@ SetResult setParameter(String rawName, String value) {
       }
       config.*(s.field) = static_cast<uint32_t>(number);
       changed = true;
-      resetTiming = name == "travel" || name == "travelms" ||
-                    name == "mintravel" || name == "mintravelms" ||
-                    name == "gap" || name == "gapms";
+      resetRound = name == "travel" || name == "travelms" ||
+                   name == "mintravel" || name == "mintravelms" ||
+                   name == "gap" || name == "gapms";
       break;
     }
   }
-
-  if (resetTiming) resetTimingLocked();
+  if (resetRound) resetRoundLocked();
   int rest = config.restAngle;
   xSemaphoreGive(stateMutex);
-
   if (!changed) return SetResult::Unknown;
   if (moveRest) servo.write(rest);
   if (refreshBackground) chooseBackground();
@@ -859,7 +743,6 @@ bool setTheme(String value) {
   else if (value == "light") mode = ThemeMode::Light;
   else if (value == "dark") mode = ThemeMode::Dark;
   else return false;
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   config.theme = mode;
   resetEnvelopeLocked();
@@ -874,11 +757,10 @@ void restoreDefaults() {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   config = Config{};
   sensorRatio = DEFAULT_SENSOR_RATIO;
-  resetTimingLocked();
+  resetRoundLocked();
   bool moveRest = !playing;
   int rest = config.restAngle;
   xSemaphoreGive(stateMutex);
-
   if (moveRest) servo.write(rest);
   chooseBackground();
   saveConfig();
@@ -891,15 +773,13 @@ void handleCommand(String line) {
   line.toLowerCase();
   if (!line.length()) return;
   if (line.startsWith("set ")) { line.remove(0, 4); line.trim(); }
-
   int split = line.indexOf(' ');
   String command = split < 0 ? line : line.substring(0, split);
   String value = split < 0 ? "" : line.substring(split + 1);
   value.trim();
-
   if (command == "help" || command == "manual" || command == "?") {}
-  else if (command == "start" || command == "run") startAutoplay(true);
-  else if (command == "arm") startAutoplay(false);
+  else if (command == "start" || command == "run") armFreshRound(true);
+  else if (command == "arm") armFreshRound(false);
   else if (command == "stop" || command == "pause") stopAutoplay();
   else if (command == "click" || command == "jump") {
     if (queueClick(nowMs(), true, false)) Serial.println("[MANUAL] Short click queued.");
@@ -913,9 +793,12 @@ void handleCommand(String line) {
                   adc, colorName(adc > cfg.threshold), cfg.threshold);
   } else if (command == "reset") {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    resetTimingLocked();
+    ++playGeneration;
+    resetRoundLocked();
+    playing = true;
     xSemaphoreGive(stateMutex);
-    Serial.println("[RESET] Learned timing/width history cleared; saved settings kept.");
+    clearClickQueue();
+    Serial.println("[RESET] Round reset. Autoplay remains armed; the next cactus becomes t=0.");
   } else if (command == "defaults") restoreDefaults();
   else if (command == "theme") {
     if (!setTheme(value)) Serial.println("[ERR] Use: theme auto | theme light | theme dark");
@@ -930,7 +813,6 @@ void serialTask(void *) {
   for (;;) {
     LogMessage message{};
     while (xQueueReceive(logQueue, &message, 0) == pdTRUE) Serial.println(message.text);
-
     while (Serial.available()) {
       char c = static_cast<char>(Serial.read());
       if (c == '\n' || c == '\r') {
@@ -957,24 +839,21 @@ void setup() {
   delay(200);
   pinMode(SENSOR_PIN, INPUT);
   analogReadResolution(12);
-
   stateMutex = xSemaphoreCreateMutex();
   if (!stateMutex) fatal("[FATAL] Could not create state mutex.");
   loadConfig();
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  resetTimingLocked();
+  resetRoundLocked();
+  playing = true;
+  ++playGeneration;
   xSemaphoreGive(stateMutex);
-
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 500, 2400);
   servo.write(config.restAngle);
-
   clickQueue = xQueueCreate(CLICK_QUEUE_SIZE, sizeof(ClickCommand));
   logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogMessage));
   if (!clickQueue || !logQueue) fatal("[FATAL] Could not create runtime queues.");
   chooseBackground();
-
   if (xTaskCreatePinnedToCore(servoTask, "dino-servo", 4096, nullptr, 5,
                               &servoTaskHandle, 1) != pdPASS ||
       xTaskCreatePinnedToCore(sensorTask, "dino-sensor", 4096, nullptr, 4,
@@ -983,8 +862,8 @@ void setup() {
                               &serialTaskHandle, 0) != pdPASS) {
     fatal("[FATAL] Could not create FreeRTOS tasks.");
   }
-
-  Serial.println("\nDino ESP32 Auto-Player ready (dual jumps + speed scaling).");
+  Serial.println("\nDino ESP32 Auto-Player ready (auto-armed + timed acceleration).");
+  Serial.println("[AUTO] Waiting for the first cactus; its trailing edge becomes round t=0.");
   Serial.println("Runtime: sensor task + servo task + serial task. loop() stays idle.");
   printStatus();
   printManual();
