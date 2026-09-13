@@ -4,43 +4,44 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 namespace {
 
 constexpr int SERVO_PIN = 18;
 constexpr int SENSOR_PIN = 15;
+constexpr int SENSOR_HYSTERESIS = 8;
 constexpr size_t CLICK_QUEUE_SIZE = 12;
-constexpr size_t HISTORY_SIZE = 5;
-constexpr size_t ADAPT_WARMUP = 3;
+constexpr size_t HISTORY_SIZE = 7;
+constexpr size_t ADAPT_WARMUP = 5;
+constexpr float DEFAULT_SENSOR_RATIO = 2.0f;
+constexpr float ADAPT_SAFETY_BIAS = 1.05f;
 constexpr uint32_t CONFIG_MAGIC = 0xD1A02026;
-constexpr uint16_t CONFIG_VERSION = 1;
+constexpr uint16_t CONFIG_VERSION = 2;
 
 enum class ThemeMode : uint8_t { Auto, Light, Dark };
 
 struct Config {
   uint32_t magic = CONFIG_MAGIC;
   uint16_t version = CONFIG_VERSION;
-
   int threshold = 200;
   int restAngle = 35;
   int pressAngle = 38;
-
   uint32_t holdMs = 80;
   uint32_t actuatorMs = 160;
   uint32_t travelMs = 1550;
   uint32_t minTravelMs = 350;
   uint32_t airMs = 450;
-  uint32_t landingMs = 30;
-  uint32_t clearanceMs = 90;
-  uint32_t gapMs = 120;
+  uint32_t landingMs = 50;
+  uint32_t clearanceMs = 100;
+  uint32_t gapMs = 40;
   uint32_t cooldownMs = 70;
   uint32_t rearmMs = 12;
   uint32_t themeFlipMs = 1500;
-  uint32_t sampleMs = 2;
-
+  uint32_t sampleMs = 5;
   bool adapt = true;
-  float adaptStepPct = 6.0f;
+  float adaptStepPct = 3.0f;
   ThemeMode theme = ThemeMode::Auto;
   bool debug = false;
 };
@@ -52,30 +53,28 @@ struct ClickCommand {
   int restAngle;
   uint32_t holdMs;
   bool manual;
+  bool debug;
 };
 
-struct DetectorState {
+struct Detector {
   bool active = false;
   uint64_t startMs = 0;
   uint64_t lastObstacleMs = 0;
   uint64_t oppositeSinceMs = 0;
-  uint64_t lastSampleMs = 0;
-
   uint64_t lastLandingMs = 0;
   uint64_t lastCommandMs = 0;
   bool hasPlan = false;
-
-  uint32_t effectiveTravelMs = 0;
+  uint32_t travelMs = 0;
   uint32_t history[HISTORY_SIZE] = {};
   size_t historyCount = 0;
   size_t historyIndex = 0;
-  uint32_t baselineEnvelopeMs = 0;
+  uint32_t baselinePulseMs = 0;
   uint32_t plannedJumps = 0;
 };
 
 struct UIntSetting {
   const char *name;
-  const char *legacyName;
+  const char *legacy;
   uint32_t Config::*field;
   uint32_t minValue;
   uint32_t maxValue;
@@ -89,319 +88,333 @@ constexpr UIntSetting UINT_SETTINGS[] = {
     {"air", "airms", &Config::airMs, 1, 3000},
     {"landing", "landingms", &Config::landingMs, 0, 2000},
     {"clearance", "clearancems", &Config::clearanceMs, 0, 3000},
-    {"gap", "gapms", &Config::gapMs, 1, 3000},
+    {"gap", "gapms", &Config::gapMs, 1, 1000},
     {"cooldown", "cooldownms", &Config::cooldownMs, 0, 3000},
     {"rearm", "rearmms", &Config::rearmMs, 0, 3000},
-    {"sample", "samplems", &Config::sampleMs, 1, 1000},
+    {"sample", "samplems", &Config::sampleMs, 2, 50},
     {"themeflip", "themeflipms", &Config::themeFlipMs, 100, 10000},
 };
 
 Servo servo;
 Preferences prefs;
 Config config;
-DetectorState detector;
-
+Detector detector;
+float sensorRatio = DEFAULT_SENSOR_RATIO;
 QueueHandle_t clickQueue = nullptr;
-TaskHandle_t clickTaskHandle = nullptr;
-
+SemaphoreHandle_t stateMutex = nullptr;
+TaskHandle_t sensorTaskHandle = nullptr;
+TaskHandle_t servoTaskHandle = nullptr;
+TaskHandle_t serialTaskHandle = nullptr;
 volatile bool playing = false;
 volatile uint32_t playGeneration = 1;
-
-String serialLine;
-bool backgroundIsWhite = true;
-int lastSensorValue = 0;
-uint32_t executedClicks = 0;
 bool prefsReady = false;
+bool backgroundIsWhite = true;
+bool filteredWhite = true;
+int lastSensorValue = 0;
+String serialLine;
 
-// ---------- Helpers ----------
-
-uint64_t nowMs() {
-  return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+uint64_t nowMs() { return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL; }
+const char *onOff(bool v) { return v ? "on" : "off"; }
+const char *colorName(bool v) { return v ? "white" : "black"; }
+const char *themeName(ThemeMode m) {
+  return m == ThemeMode::Light ? "light" : m == ThemeMode::Dark ? "dark" : "auto";
 }
 
-const char *onOff(bool value) { return value ? "on" : "off"; }
-const char *colorName(bool white) { return white ? "white" : "black"; }
-
-const char *themeName(ThemeMode mode) {
-  if (mode == ThemeMode::Light) return "light";
-  if (mode == ThemeMode::Dark) return "dark";
-  return "auto";
+Config getConfig() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  Config copy = config;
+  xSemaphoreGive(stateMutex);
+  return copy;
 }
 
-bool sensorIsWhite(int value) { return value > config.threshold; }
-
-String normalize(String text) {
-  text.trim();
-  text.toLowerCase();
-  text.replace("_", "");
-  text.replace("-", "");
-  return text;
+String normalize(String s) {
+  s.trim();
+  s.toLowerCase();
+  s.replace("_", "");
+  s.replace("-", "");
+  return s;
 }
 
-bool parseLong(const String &text, long &value) {
+bool parseLong(const String &s, long &out) {
   char *end = nullptr;
-  value = strtol(text.c_str(), &end, 10);
+  out = strtol(s.c_str(), &end, 10);
   while (end && *end == ' ') ++end;
-  return end && end != text.c_str() && *end == '\0';
+  return end && end != s.c_str() && *end == '\0';
 }
 
-bool parseFloat(const String &text, float &value) {
+bool parseFloatValue(const String &s, float &out) {
   char *end = nullptr;
-  value = strtof(text.c_str(), &end);
+  out = strtof(s.c_str(), &end);
   while (end && *end == ' ') ++end;
-  return end && end != text.c_str() && *end == '\0';
+  return end && end != s.c_str() && *end == '\0';
 }
 
-bool parseBool(String text, bool &value) {
-  text = normalize(text);
-  if (text == "on" || text == "true" || text == "1" || text == "yes") {
-    value = true;
+bool parseBool(String s, bool &out) {
+  s = normalize(s);
+  if (s == "on" || s == "true" || s == "1" || s == "yes") {
+    out = true;
     return true;
   }
-  if (text == "off" || text == "false" || text == "0" || text == "no") {
-    value = false;
+  if (s == "off" || s == "false" || s == "0" || s == "no") {
+    out = false;
     return true;
   }
   return false;
 }
 
-// ---------- Configuration in flash (ESP32 NVS) ----------
+// Persistent configuration -------------------------------------------------
 
-bool configValid() {
-  return config.magic == CONFIG_MAGIC &&
-         config.version == CONFIG_VERSION &&
-         config.threshold >= 0 && config.threshold <= 4095 &&
-         config.restAngle >= 0 && config.restAngle <= 180 &&
-         config.pressAngle >= 0 && config.pressAngle <= 180 &&
-         config.holdMs >= 1 && config.holdMs <= 2000 &&
-         config.actuatorMs <= 5000 &&
-         config.travelMs >= 1 && config.travelMs <= 10000 &&
-         config.minTravelMs >= 1 && config.minTravelMs <= 10000 &&
-         config.airMs >= 1 && config.airMs <= 3000 &&
-         config.landingMs <= 2000 &&
-         config.clearanceMs <= 3000 &&
-         config.gapMs >= 1 && config.gapMs <= 3000 &&
-         config.cooldownMs <= 3000 &&
-         config.rearmMs <= 3000 &&
-         config.themeFlipMs >= 100 && config.themeFlipMs <= 10000 &&
-         config.sampleMs >= 1 && config.sampleMs <= 1000 &&
-         config.adaptStepPct > 0.0f && config.adaptStepPct <= 50.0f &&
-         static_cast<uint8_t>(config.theme) <= 2;
+bool configValid(const Config &c) {
+  return c.magic == CONFIG_MAGIC && c.version == CONFIG_VERSION &&
+         c.threshold >= 0 && c.threshold <= 4095 &&
+         c.restAngle >= 0 && c.restAngle <= 180 &&
+         c.pressAngle >= 0 && c.pressAngle <= 180 &&
+         c.holdMs >= 1 && c.holdMs <= 2000 && c.actuatorMs <= 5000 &&
+         c.travelMs >= 1 && c.travelMs <= 10000 &&
+         c.minTravelMs >= 1 && c.minTravelMs <= 10000 &&
+         c.airMs >= 1 && c.airMs <= 3000 && c.landingMs <= 2000 &&
+         c.clearanceMs <= 3000 && c.gapMs >= 1 && c.gapMs <= 1000 &&
+         c.cooldownMs <= 3000 && c.rearmMs <= 3000 &&
+         c.themeFlipMs >= 100 && c.themeFlipMs <= 10000 &&
+         c.sampleMs >= 2 && c.sampleMs <= 50 &&
+         c.adaptStepPct > 0 && c.adaptStepPct <= 20 &&
+         static_cast<uint8_t>(c.theme) <= 2;
+}
+
+void migrateV1(Config &c) {
+  if (c.version != 1) return;
+  c.version = CONFIG_VERSION;
+  if (c.sampleMs == 2) c.sampleMs = 5;
+  if (c.gapMs == 120) c.gapMs = 40;
+  if (c.landingMs == 30) c.landingMs = 50;
+  if (c.clearanceMs == 90) c.clearanceMs = 100;
+  if (c.adaptStepPct == 6.0f) c.adaptStepPct = 3.0f;
 }
 
 bool saveConfig(bool announce = true) {
-  if (!prefsReady) {
-    if (announce) Serial.println("[SAVE] Flash storage unavailable.");
-    return false;
-  }
-
-  const bool ok =
-      prefs.putBytes("config", &config, sizeof(config)) == sizeof(config);
-  if (announce) {
-    Serial.println(ok ? "[SAVE] Configuration saved."
-                      : "[SAVE] Could not save configuration.");
-  }
+  if (!prefsReady) return false;
+  Config copy = getConfig();
+  bool ok = prefs.putBytes("config", &copy, sizeof(copy)) == sizeof(copy);
+  if (announce) Serial.println(ok ? "[SAVE] Saved to flash." : "[SAVE] Flash write failed.");
   return ok;
 }
 
 void loadConfig() {
   prefsReady = prefs.begin("dino", false);
   if (!prefsReady) {
-    Serial.println("[NVS] Flash storage unavailable; using defaults.");
+    Serial.println("[NVS] Flash unavailable; using defaults.");
     return;
   }
 
-  const bool hasSavedConfig =
-      prefs.getBytesLength("config") == sizeof(config);
-
-  if (hasSavedConfig) {
-    prefs.getBytes("config", &config, sizeof(config));
+  bool hasSaved = prefs.getBytesLength("config") == sizeof(config);
+  bool migrated = false;
+  if (hasSaved) prefs.getBytes("config", &config, sizeof(config));
+  if (hasSaved && config.magic == CONFIG_MAGIC && config.version == 1) {
+    migrateV1(config);
+    migrated = true;
   }
 
-  if (!hasSavedConfig || !configValid()) {
+  if (!hasSaved || !configValid(config)) {
     config = Config{};
-    saveConfig(false);
+    prefs.putBytes("config", &config, sizeof(config));
     Serial.println("[NVS] Defaults loaded and saved.");
   } else {
-    Serial.println("[NVS] Saved configuration loaded.");
+    if (migrated) prefs.putBytes("config", &config, sizeof(config));
+    Serial.println(migrated ? "[NVS] Configuration migrated."
+                            : "[NVS] Saved configuration loaded.");
   }
+
+  sensorRatio = prefs.getFloat("ratio", DEFAULT_SENSOR_RATIO);
+  if (sensorRatio < 0.5f || sensorRatio > 6.0f) sensorRatio = DEFAULT_SENSOR_RATIO;
 }
 
-// ---------- Timing model ----------
+// Sensor and timing model --------------------------------------------------
 
-void resetEnvelope() {
+int readSensor() { return analogRead(SENSOR_PIN); }
+
+int median3(int a, int b, int c) {
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) b = a;
+  return b;
+}
+
+bool classifyWhite(int adc, int threshold, bool previous) {
+  return previous ? adc > threshold - SENSOR_HYSTERESIS
+                  : adc > threshold + SENSOR_HYSTERESIS;
+}
+
+void resetEnvelopeLocked() {
   detector.active = false;
   detector.startMs = 0;
   detector.lastObstacleMs = 0;
   detector.oppositeSinceMs = 0;
 }
 
-void resetTiming() {
-  detector = DetectorState{};
-  detector.effectiveTravelMs = config.travelMs;
+void resetTimingLocked() {
+  detector = Detector{};
+  detector.travelMs = config.travelMs;
 }
 
-uint32_t shortestEnvelope() {
-  if (!detector.historyCount) return 0;
-
-  uint32_t shortest = detector.history[0];
+uint32_t speedPulseLocked() {
+  uint32_t values[HISTORY_SIZE];
+  for (size_t i = 0; i < detector.historyCount; ++i) values[i] = detector.history[i];
   for (size_t i = 1; i < detector.historyCount; ++i) {
-    if (detector.history[i] < shortest) shortest = detector.history[i];
+    uint32_t v = values[i];
+    size_t j = i;
+    while (j && values[j - 1] > v) {
+      values[j] = values[j - 1];
+      --j;
+    }
+    values[j] = v;
   }
-  return shortest;
+  size_t index = (detector.historyCount * 35) / 100;
+  return values[index < detector.historyCount ? index : detector.historyCount - 1];
 }
 
-void updateTravel(uint32_t envelopeMs) {
-  detector.history[detector.historyIndex] = envelopeMs;
+void updateTravelLocked(uint32_t pulseMs) {
+  detector.history[detector.historyIndex] = pulseMs;
   detector.historyIndex = (detector.historyIndex + 1) % HISTORY_SIZE;
   if (detector.historyCount < HISTORY_SIZE) ++detector.historyCount;
 
-  const uint32_t shortest = shortestEnvelope();
+  uint32_t pulse = speedPulseLocked();
+  if (!detector.baselinePulseMs && detector.historyCount >= ADAPT_WARMUP)
+    detector.baselinePulseMs = pulse;
+  if (!config.adapt || !detector.baselinePulseMs || pulse >= detector.baselinePulseMs) return;
 
-  if (!detector.baselineEnvelopeMs &&
-      detector.historyCount >= ADAPT_WARMUP) {
-    detector.baselineEnvelopeMs = shortest;
-  }
-
-  if (!config.adapt || !detector.baselineEnvelopeMs ||
-      shortest >= detector.baselineEnvelopeMs) {
-    return;
-  }
-
-  uint32_t target = static_cast<uint32_t>(
-      static_cast<uint64_t>(config.travelMs) * shortest /
-      detector.baselineEnvelopeMs);
+  float target = static_cast<float>(config.travelMs) * pulse /
+                 detector.baselinePulseMs * ADAPT_SAFETY_BIAS;
   if (target < config.minTravelMs) target = config.minTravelMs;
-  if (target >= detector.effectiveTravelMs) return;
+  if (target >= detector.travelMs) return;
 
-  uint32_t maxDrop = static_cast<uint32_t>(
-      detector.effectiveTravelMs * config.adaptStepPct / 100.0f);
-  if (!maxDrop) maxDrop = 1;
-
-  uint32_t limited =
-      detector.effectiveTravelMs > maxDrop
-          ? detector.effectiveTravelMs - maxDrop
-          : config.minTravelMs;
-
-  detector.effectiveTravelMs = target > limited ? target : limited;
-  if (detector.effectiveTravelMs < config.minTravelMs) {
-    detector.effectiveTravelMs = config.minTravelMs;
-  }
-
-  if (config.debug) {
-    Serial.printf("[ADAPT] envelope=%lu shortest=%lu travel=%lu\n",
-                  static_cast<unsigned long>(envelopeMs),
-                  static_cast<unsigned long>(shortest),
-                  static_cast<unsigned long>(detector.effectiveTravelMs));
-  }
+  uint32_t drop = static_cast<uint32_t>(detector.travelMs * config.adaptStepPct / 100.0f);
+  if (!drop) drop = 1;
+  uint32_t floor = detector.travelMs > drop ? detector.travelMs - drop : config.minTravelMs;
+  detector.travelMs = static_cast<uint32_t>(target > floor ? target : floor);
+  if (detector.travelMs < config.minTravelMs) detector.travelMs = config.minTravelMs;
 }
 
-// ---------- Servo FreeRTOS task ----------
-
 void clearClickQueue() {
-  if (!clickQueue) return;
   ClickCommand ignored{};
-  while (xQueueReceive(clickQueue, &ignored, 0) == pdTRUE) {}
+  while (clickQueue && xQueueReceive(clickQueue, &ignored, 0) == pdTRUE) {}
+}
+
+bool queueClick(uint64_t atMs, bool manual, const Config &cfg) {
+  ClickCommand cmd{atMs, playGeneration, cfg.pressAngle, cfg.restAngle,
+                   cfg.holdMs, manual, cfg.debug};
+  if (xQueueSend(clickQueue, &cmd, 0) == pdTRUE) return true;
+  Serial.println("[WARN] Servo queue full; click dropped.");
+  return false;
 }
 
 bool queueClick(uint64_t atMs, bool manual) {
-  ClickCommand command{
-      atMs, playGeneration, config.pressAngle,
-      config.restAngle, config.holdMs, manual};
-
-  BaseType_t result =
-      manual ? xQueueSendToFront(clickQueue, &command, 0)
-             : xQueueSend(clickQueue, &command, 0);
-
-  if (result != pdTRUE) {
-    Serial.println("[WARN] Servo queue full; click dropped.");
-    return false;
-  }
-  return true;
+  return queueClick(atMs, manual, getConfig());
 }
 
-void servoTask(void *) {
-  for (;;) {
-    ClickCommand command{};
-    if (xQueueReceive(clickQueue, &command, portMAX_DELAY) != pdTRUE) continue;
+void insertPending(ClickCommand *pending, size_t &count, const ClickCommand &cmd) {
+  if (count >= CLICK_QUEUE_SIZE) return;
+  size_t i = count;
+  while (i && pending[i - 1].atMs > cmd.atMs) {
+    pending[i] = pending[i - 1];
+    --i;
+  }
+  pending[i] = cmd;
+  ++count;
+}
 
-    bool cancelled = false;
-    for (;;) {
-      if (!command.manual &&
-          (!playing || command.generation != playGeneration)) {
-        cancelled = true;
-        break;
-      }
-
-      const uint64_t now = nowMs();
-      if (now >= command.atMs) break;
-
-      const uint64_t remaining = command.atMs - now;
-      uint32_t sleepMs = remaining > 5 ? 5 : static_cast<uint32_t>(remaining);
-      if (!sleepMs) sleepMs = 1;
-      vTaskDelay(pdMS_TO_TICKS(sleepMs));
+void prunePending(ClickCommand *pending, size_t &count) {
+  size_t out = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (pending[i].manual ||
+        (playing && pending[i].generation == playGeneration)) {
+      pending[out++] = pending[i];
     }
-    if (cancelled) continue;
+  }
+  count = out;
+}
 
-    const uint64_t actual = nowMs();
-    const uint64_t late = actual > command.atMs ? actual - command.atMs : 0;
+// Servo task ---------------------------------------------------------------
 
-    servo.write(command.pressAngle);
-    TickType_t holdTicks = pdMS_TO_TICKS(command.holdMs);
-    vTaskDelay(holdTicks ? holdTicks : 1);
-    servo.write(command.restAngle);
+void servoTask(void *) {
+  ClickCommand pending[CLICK_QUEUE_SIZE]{};
+  size_t count = 0;
 
-    ++executedClicks;
-    if (config.debug) {
-      Serial.printf("[CLICK] #%lu task-late=%llu ms\n",
-                    static_cast<unsigned long>(executedClicks),
+  for (;;) {
+    prunePending(pending, count);
+    TickType_t wait = portMAX_DELAY;
+    if (count) {
+      uint64_t now = nowMs();
+      uint64_t ms = pending[0].atMs > now ? pending[0].atMs - now : 0;
+      wait = ms ? pdMS_TO_TICKS(static_cast<uint32_t>(ms)) : 0;
+    }
+
+    ClickCommand incoming{};
+    if (xQueueReceive(clickQueue, &incoming, wait) == pdTRUE) {
+      insertPending(pending, count, incoming);
+      continue;
+    }
+    if (!count) continue;
+
+    ClickCommand cmd = pending[0];
+    for (size_t i = 1; i < count; ++i) pending[i - 1] = pending[i];
+    --count;
+    if (!cmd.manual && (!playing || cmd.generation != playGeneration)) continue;
+
+    uint64_t actual = nowMs();
+    servo.write(cmd.pressAngle);
+    TickType_t hold = pdMS_TO_TICKS(cmd.holdMs);
+    vTaskDelay(hold ? hold : 1);
+    servo.write(cmd.restAngle);
+
+    if (cmd.debug) {
+      uint64_t late = actual > cmd.atMs ? actual - cmd.atMs : 0;
+      Serial.printf("[CLICK] task-late=%llu ms\n",
                     static_cast<unsigned long long>(late));
     }
   }
 }
 
-// ---------- Obstacle detection and jump planning ----------
-
-void finalizeEnvelope(uint64_t now) {
+void finalizeEnvelopeLocked(uint64_t now) {
   if (!detector.active || detector.lastObstacleMs < detector.startMs) {
-    resetEnvelope();
+    resetEnvelopeLocked();
     return;
   }
 
-  uint32_t envelopeMs =
-      static_cast<uint32_t>(detector.lastObstacleMs - detector.startMs);
-  if (!envelopeMs) envelopeMs = 1;
-  updateTravel(envelopeMs);
+  uint32_t pulseMs = static_cast<uint32_t>(detector.lastObstacleMs - detector.startMs);
+  if (!pulseMs) pulseMs = 1;
+  updateTravelLocked(pulseMs);
 
-  const int64_t entry =
-      static_cast<int64_t>(detector.startMs) + detector.effectiveTravelMs;
-  const int64_t exit =
-      static_cast<int64_t>(detector.lastObstacleMs) + detector.effectiveTravelMs;
+  // A wide optical spot makes the measured pulse wider than the cactus.
+  // ratio=2 means the sensor spot is about twice a normal cactus width.
+  float edgeFraction = sensorRatio / (2.0f * (sensorRatio + 1.0f));
+  int64_t correction = static_cast<int64_t>(pulseMs * edgeFraction);
+  int64_t entry = static_cast<int64_t>(detector.startMs) +
+                  correction + detector.travelMs;
+  int64_t exit = static_cast<int64_t>(detector.lastObstacleMs) -
+                 correction + detector.travelMs;
 
-  const int64_t exitContact = exit + config.landingMs - config.airMs;
-  const int64_t safeContact = entry - config.clearanceMs;
+  int64_t exitContact = exit + config.landingMs - config.airMs;
+  int64_t safeContact = entry - config.clearanceMs;
   int64_t commandAt =
-      (exitContact < safeContact ? exitContact : safeContact) -
-      config.actuatorMs;
+      (exitContact < safeContact ? exitContact : safeContact) - config.actuatorMs;
 
-  const bool entrySafety = safeContact < exitContact;
-  bool delayedForLanding = false;
-  bool delayedForCooldown = false;
+  bool entrySafety = safeContact < exitContact;
+  bool delayedLanding = false;
+  bool delayedCooldown = false;
 
   if (detector.hasPlan) {
-    const int64_t afterLanding =
-        static_cast<int64_t>(detector.lastLandingMs) +
-        config.rearmMs - config.actuatorMs;
-    const int64_t afterCooldown =
+    int64_t afterLanding = static_cast<int64_t>(detector.lastLandingMs) +
+                           config.rearmMs - config.actuatorMs;
+    int64_t afterCooldown =
         static_cast<int64_t>(detector.lastCommandMs) + config.cooldownMs;
 
     if (commandAt < afterLanding) {
       commandAt = afterLanding;
-      delayedForLanding = true;
+      delayedLanding = true;
     }
     if (commandAt < afterCooldown) {
       commandAt = afterCooldown;
-      delayedForCooldown = true;
+      delayedCooldown = true;
     }
   }
 
@@ -411,263 +424,338 @@ void finalizeEnvelope(uint64_t now) {
     commandAt = static_cast<int64_t>(now);
   }
 
-  const char *reason = "exit-aligned";
-  if (lateMs) reason = "sensor-too-close";
-  else if (delayedForLanding) reason = "post-landing-rejump";
-  else if (delayedForCooldown) reason = "cooldown";
-  else if (entrySafety) reason = "entry-safety";
+  const char *reason = lateMs ? "sensor-too-close" :
+                       delayedLanding ? "post-landing-rejump" :
+                       delayedCooldown ? "cooldown" :
+                       entrySafety ? "entry-safety" : "exit-aligned";
+  uint64_t executeAt = static_cast<uint64_t>(commandAt);
 
-  const uint64_t executeAt = static_cast<uint64_t>(commandAt);
-  if (queueClick(executeAt, false)) {
+  if (queueClick(executeAt, false, config)) {
     ++detector.plannedJumps;
     detector.lastCommandMs = executeAt;
     detector.lastLandingMs = executeAt + config.actuatorMs + config.airMs;
     detector.hasPlan = true;
 
     Serial.printf(
-        "[PLAN] #%lu envelope=%lu travel=%lu command-in=%lld late=%llu %s\n",
+        "[PLAN] #%lu pulse=%lu travel=%lu cmd-in=%lld late=%llu %s\n",
         static_cast<unsigned long>(detector.plannedJumps),
-        static_cast<unsigned long>(envelopeMs),
-        static_cast<unsigned long>(detector.effectiveTravelMs),
+        static_cast<unsigned long>(pulseMs),
+        static_cast<unsigned long>(detector.travelMs),
         static_cast<long long>(
             static_cast<int64_t>(executeAt) - static_cast<int64_t>(now)),
         static_cast<unsigned long long>(lateMs), reason);
   }
+  resetEnvelopeLocked();
+}
 
-  resetEnvelope();
+// Sensor / planner task ----------------------------------------------------
+
+void sensorTask(void *) {
+  TickType_t wake = xTaskGetTickCount();
+  int first = readSensor();
+  int samples[3] = {first, first, first};
+  size_t sampleIndex = 0;
+  filteredWhite = first > config.threshold;
+
+  for (;;) {
+    Config cfg = getConfig();
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(cfg.sampleMs));
+
+    samples[sampleIndex] = readSensor();
+    sampleIndex = (sampleIndex + 1) % 3;
+    int adc = median3(samples[0], samples[1], samples[2]);
+    uint64_t now = nowMs();
+    bool themeChanged = false;
+    bool newBackground = false;
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    lastSensorValue = adc;
+    filteredWhite = classifyWhite(adc, config.threshold, filteredWhite);
+
+    if (playing) {
+      bool obstacle = filteredWhite != backgroundIsWhite;
+
+      if (config.theme == ThemeMode::Auto) {
+        if (obstacle) {
+          if (!detector.oppositeSinceMs) detector.oppositeSinceMs = now;
+          if (now - detector.oppositeSinceMs >= config.themeFlipMs) {
+            backgroundIsWhite = filteredWhite;
+            newBackground = backgroundIsWhite;
+            resetEnvelopeLocked();
+            obstacle = false;
+            themeChanged = true;
+          }
+        } else {
+          detector.oppositeSinceMs = 0;
+        }
+      }
+
+      if (obstacle) {
+        if (!detector.active) {
+          detector.active = true;
+          detector.startMs = now;
+        }
+        detector.lastObstacleMs = now;
+      } else if (detector.active &&
+                 now - detector.lastObstacleMs >= config.gapMs) {
+        finalizeEnvelopeLocked(now);
+      }
+    }
+    xSemaphoreGive(stateMutex);
+
+    if (themeChanged) {
+      Serial.printf("[THEME] Background rebased to %s.\n",
+                    colorName(newBackground));
+    }
+  }
 }
 
 void chooseBackground() {
-  lastSensorValue = analogRead(SENSOR_PIN);
-
-  if (config.theme == ThemeMode::Light) backgroundIsWhite = true;
-  else if (config.theme == ThemeMode::Dark) backgroundIsWhite = false;
-  else backgroundIsWhite = sensorIsWhite(lastSensorValue);
+  int adc = readSensor();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  lastSensorValue = adc;
+  filteredWhite = adc > config.threshold;
+  backgroundIsWhite = config.theme == ThemeMode::Light ? true :
+                      config.theme == ThemeMode::Dark ? false : filteredWhite;
+  xSemaphoreGive(stateMutex);
 }
 
-void processSensor() {
-  const uint64_t now = nowMs();
-  if (now - detector.lastSampleMs < config.sampleMs) return;
-  detector.lastSampleMs = now;
-
-  lastSensorValue = analogRead(SENSOR_PIN);
-  if (!playing) return;
-
-  const bool white = sensorIsWhite(lastSensorValue);
-  bool obstacle = white != backgroundIsWhite;
-
-  if (config.theme == ThemeMode::Auto) {
-    if (obstacle) {
-      if (!detector.oppositeSinceMs) detector.oppositeSinceMs = now;
-
-      if (now - detector.oppositeSinceMs >= config.themeFlipMs) {
-        backgroundIsWhite = white;
-        resetEnvelope();
-        Serial.printf("[THEME] Background rebased to %s.\n",
-                      colorName(backgroundIsWhite));
-        return;
-      }
-    } else {
-      detector.oppositeSinceMs = 0;
-    }
-  }
-
-  obstacle = white != backgroundIsWhite;
-  if (obstacle) {
-    if (!detector.active) {
-      detector.active = true;
-      detector.startMs = now;
-      if (config.debug) {
-        Serial.printf("[SENSOR] obstacle start, ADC=%d\n", lastSensorValue);
-      }
-    }
-    detector.lastObstacleMs = now;
-  } else if (detector.active &&
-             now - detector.lastObstacleMs >= config.gapMs) {
-    finalizeEnvelope(now);
-  }
-}
-
-// ---------- Serial console ----------
+// Serial console -----------------------------------------------------------
 
 void printManual() {
-  Serial.println();
-  Serial.println("start | arm | stop | click | show | sensor | reset | defaults");
+  Serial.println("\nstart | arm | stop | click | show | sensor | reset | defaults");
   Serial.println("theme auto|light|dark");
   Serial.println("<name> <value>  (auto-saved)");
   Serial.println("threshold rest press hold actuator travel mintravel air landing");
-  Serial.println("clearance gap cooldown rearm sample themeflip adapt adaptstep debug");
-  Serial.println("Example: press 38   travel 1550   adapt on");
-  Serial.println();
+  Serial.println("clearance gap sample cooldown rearm ratio adapt adaptstep debug");
+  Serial.println("Example: press 38   travel 1550   ratio 2.0   adapt on\n");
 }
 
 void printStatus() {
-  const int sensor = analogRead(SENSOR_PIN);
+  Config cfg = getConfig();
+  int adc = readSensor();
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  float ratio = sensorRatio;
+  uint32_t effective = detector.travelMs;
+  bool bg = backgroundIsWhite;
+  xSemaphoreGive(stateMutex);
 
   Serial.println("\n=== Dino Auto-Player ===");
-  Serial.printf("Run=%s | sensor=%d (%s) | threshold=%d | theme=%s\n",
-                playing ? "ON" : "OFF", sensor,
-                colorName(sensorIsWhite(sensor)),
-                config.threshold, themeName(config.theme));
+  Serial.printf(
+      "Run=%s | sensor=%d (%s) | threshold=%d | background=%s | theme=%s\n",
+      playing ? "ON" : "OFF", adc, colorName(adc > cfg.threshold),
+      cfg.threshold, colorName(bg), themeName(cfg.theme));
   Serial.printf("Servo: rest=%d press=%d hold=%lu ms\n",
-                config.restAngle, config.pressAngle,
-                static_cast<unsigned long>(config.holdMs));
+                cfg.restAngle, cfg.pressAngle,
+                static_cast<unsigned long>(cfg.holdMs));
   Serial.printf(
       "Timing: actuator=%lu travel=%lu effective=%lu air=%lu landing=%lu clearance=%lu\n",
-      static_cast<unsigned long>(config.actuatorMs),
-      static_cast<unsigned long>(config.travelMs),
-      static_cast<unsigned long>(detector.effectiveTravelMs),
-      static_cast<unsigned long>(config.airMs),
-      static_cast<unsigned long>(config.landingMs),
-      static_cast<unsigned long>(config.clearanceMs));
-  Serial.printf(
-      "Detector: gap=%lu cooldown=%lu rearm=%lu sample=%lu themeflip=%lu\n",
-      static_cast<unsigned long>(config.gapMs),
-      static_cast<unsigned long>(config.cooldownMs),
-      static_cast<unsigned long>(config.rearmMs),
-      static_cast<unsigned long>(config.sampleMs),
-      static_cast<unsigned long>(config.themeFlipMs));
+      static_cast<unsigned long>(cfg.actuatorMs),
+      static_cast<unsigned long>(cfg.travelMs),
+      static_cast<unsigned long>(effective),
+      static_cast<unsigned long>(cfg.airMs),
+      static_cast<unsigned long>(cfg.landingMs),
+      static_cast<unsigned long>(cfg.clearanceMs));
+  Serial.printf("Sensor: sample=%lu ms gap=%lu ms ratio=%.2f:1 hysteresis=%d\n",
+                static_cast<unsigned long>(cfg.sampleMs),
+                static_cast<unsigned long>(cfg.gapMs), ratio,
+                SENSOR_HYSTERESIS);
   Serial.printf("Adapt=%s mintravel=%lu step=%.1f%% | debug=%s | flash=%s\n",
-                onOff(config.adapt),
-                static_cast<unsigned long>(config.minTravelMs),
-                config.adaptStepPct, onOff(config.debug),
+                onOff(cfg.adapt),
+                static_cast<unsigned long>(cfg.minTravelMs),
+                cfg.adaptStepPct, onOff(cfg.debug),
                 prefsReady ? "ready" : "unavailable");
 }
 
 void startAutoplay(bool clickToStart) {
-  ++playGeneration;
-  clearClickQueue();
-  resetTiming();
   chooseBackground();
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  ++playGeneration;
+  resetTimingLocked();
   playing = true;
+  bool bg = backgroundIsWhite;
+  int adc = lastSensorValue;
+  xSemaphoreGive(stateMutex);
+  clearClickQueue();
 
-  Serial.printf("[START] Armed. Background=%s, sensor=%d.\n",
-                colorName(backgroundIsWhite), lastSensorValue);
-
+  Serial.printf("[START] Armed. Background=%s sensor=%d.\n",
+                colorName(bg), adc);
   if (clickToStart && queueClick(nowMs(), true)) {
     Serial.println("[START] Initial click queued.");
   }
 }
 
 void stopAutoplay() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
   playing = false;
   ++playGeneration;
+  resetEnvelopeLocked();
+  int rest = config.restAngle;
+  xSemaphoreGive(stateMutex);
+
   clearClickQueue();
-  resetEnvelope();
-  servo.write(config.restAngle);
+  servo.write(rest);
   Serial.println("[STOP] Autoplay stopped.");
-}
-
-bool setTheme(String value) {
-  value = normalize(value);
-
-  if (value == "auto") config.theme = ThemeMode::Auto;
-  else if (value == "light") config.theme = ThemeMode::Light;
-  else if (value == "dark") config.theme = ThemeMode::Dark;
-  else return false;
-
-  chooseBackground();
-  resetEnvelope();
-  saveConfig();
-  Serial.printf("[THEME] %s.\n", themeName(config.theme));
-  return true;
 }
 
 enum class SetResult { Changed, Invalid, Unknown };
 
 SetResult setParameter(String rawName, String value) {
-  const String name = normalize(rawName);
+  String name = normalize(rawName);
   long number = 0;
+
+  if (name == "ratio") {
+    float ratio;
+    if (!parseFloatValue(value, ratio) || ratio < 0.5f || ratio > 6.0f)
+      return SetResult::Invalid;
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    sensorRatio = ratio;
+    xSemaphoreGive(stateMutex);
+    if (prefsReady) prefs.putFloat("ratio", ratio);
+    Serial.printf("[SET] ratio = %.2f\n", ratio);
+    return SetResult::Changed;
+  }
+
   bool changed = false;
+  bool resetTiming = false;
+  bool refreshBackground = false;
+  bool moveRest = false;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
 
   if (name == "threshold" || name == "rest" ||
       name == "press" || name == "clickangle") {
-    if (!parseLong(value, number)) return SetResult::Invalid;
-
-    if (name == "threshold" && number >= 0 && number <= 4095)
-      config.threshold = static_cast<int>(number);
-    else if (name == "rest" && number >= 0 && number <= 180)
-      config.restAngle = static_cast<int>(number);
-    else if ((name == "press" || name == "clickangle") &&
-             number >= 0 && number <= 180)
-      config.pressAngle = static_cast<int>(number);
-    else
+    if (!parseLong(value, number)) {
+      xSemaphoreGive(stateMutex);
       return SetResult::Invalid;
+    }
+
+    if (name == "threshold" && number >= 0 && number <= 4095) {
+      config.threshold = number;
+    } else if (name == "rest" && number >= 0 && number <= 180) {
+      config.restAngle = number;
+    } else if ((name == "press" || name == "clickangle") &&
+               number >= 0 && number <= 180) {
+      config.pressAngle = number;
+    } else {
+      xSemaphoreGive(stateMutex);
+      return SetResult::Invalid;
+    }
 
     changed = true;
+    refreshBackground = name == "threshold";
+    moveRest = name == "rest" && !playing;
   } else if (name == "adapt" || name == "debug" || name == "autotheme") {
-    bool flag = false;
-    if (!parseBool(value, flag)) return SetResult::Invalid;
+    bool flag;
+    if (!parseBool(value, flag)) {
+      xSemaphoreGive(stateMutex);
+      return SetResult::Invalid;
+    }
 
-    if (name == "adapt") config.adapt = flag;
-    else if (name == "debug") config.debug = flag;
-    else {
-      config.theme = flag
-          ? ThemeMode::Auto
-          : (backgroundIsWhite ? ThemeMode::Light : ThemeMode::Dark);
+    if (name == "adapt") {
+      config.adapt = flag;
+      resetTiming = true;
+    } else if (name == "debug") {
+      config.debug = flag;
+    } else {
+      config.theme = flag ? ThemeMode::Auto
+                          : (backgroundIsWhite ? ThemeMode::Light
+                                               : ThemeMode::Dark);
     }
     changed = true;
+    refreshBackground = name == "autotheme";
   } else if (name == "adaptstep") {
-    float percent = 0.0f;
-    if (!parseFloat(value, percent) || percent <= 0.0f || percent > 50.0f)
+    float percent;
+    if (!parseFloatValue(value, percent) || percent <= 0 || percent > 20) {
+      xSemaphoreGive(stateMutex);
       return SetResult::Invalid;
+    }
     config.adaptStepPct = percent;
     changed = true;
   } else {
-    for (const auto &setting : UINT_SETTINGS) {
-      if (name != setting.name && name != setting.legacyName) continue;
+    for (const auto &s : UINT_SETTINGS) {
+      if (name != s.name && name != s.legacy) continue;
       if (!parseLong(value, number) || number < 0 ||
-          static_cast<uint32_t>(number) < setting.minValue ||
-          static_cast<uint32_t>(number) > setting.maxValue) {
+          static_cast<uint32_t>(number) < s.minValue ||
+          static_cast<uint32_t>(number) > s.maxValue) {
+        xSemaphoreGive(stateMutex);
         return SetResult::Invalid;
       }
-      config.*(setting.field) = static_cast<uint32_t>(number);
+
+      config.*(s.field) = static_cast<uint32_t>(number);
       changed = true;
+      resetTiming = name == "travel" || name == "travelms" ||
+                    name == "mintravel" || name == "mintravelms";
       break;
     }
   }
 
+  if (resetTiming) resetTimingLocked();
+  int rest = config.restAngle;
+  xSemaphoreGive(stateMutex);
+
   if (!changed) return SetResult::Unknown;
-
-  if (name == "rest" && !playing) servo.write(config.restAngle);
-  if (name == "travel" || name == "travelms" ||
-      name == "mintravel" || name == "mintravelms" || name == "adapt") {
-    resetTiming();
-  }
-  if (name == "threshold" || name == "autotheme") chooseBackground();
-
+  if (moveRest) servo.write(rest);
+  if (refreshBackground) chooseBackground();
   saveConfig();
   Serial.printf("[SET] %s = %s\n", rawName.c_str(), value.c_str());
   return SetResult::Changed;
 }
 
-void restoreDefaults() {
-  config = Config{};
-  saveConfig();
-  resetTiming();
+bool setTheme(String value) {
+  value = normalize(value);
+  ThemeMode mode;
+  if (value == "auto") mode = ThemeMode::Auto;
+  else if (value == "light") mode = ThemeMode::Light;
+  else if (value == "dark") mode = ThemeMode::Dark;
+  else return false;
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  config.theme = mode;
+  resetEnvelopeLocked();
+  xSemaphoreGive(stateMutex);
+
   chooseBackground();
-  if (!playing) servo.write(config.restAngle);
-  Serial.println("[DEFAULTS] Defaults restored.");
+  saveConfig();
+  Serial.printf("[THEME] %s.\n", themeName(mode));
+  return true;
+}
+
+void restoreDefaults() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  config = Config{};
+  sensorRatio = DEFAULT_SENSOR_RATIO;
+  resetTimingLocked();
+  bool moveRest = !playing;
+  int rest = config.restAngle;
+  xSemaphoreGive(stateMutex);
+
+  if (moveRest) servo.write(rest);
+  chooseBackground();
+  saveConfig();
+  if (prefsReady) prefs.putFloat("ratio", DEFAULT_SENSOR_RATIO);
+  Serial.println("[DEFAULTS] Defaults restored and saved.");
 }
 
 void handleCommand(String line) {
   line.trim();
   line.toLowerCase();
-  if (line.length() == 0) return;
+  if (!line.length()) return;
 
-  // Old commands such as "set travel_ms 1550" still work.
+  // Keep compatibility with older commands such as "set travel_ms 1550".
   if (line.startsWith("set ")) {
     line.remove(0, 4);
     line.trim();
   }
 
-  const int split = line.indexOf(' ');
-  const String command = split < 0 ? line : line.substring(0, split);
+  int split = line.indexOf(' ');
+  String command = split < 0 ? line : line.substring(0, split);
   String value = split < 0 ? "" : line.substring(split + 1);
   value.trim();
 
   if (command == "help" || command == "manual" || command == "?") {
-    return;
   } else if (command == "start" || command == "run") {
     startAutoplay(true);
   } else if (command == "arm") {
@@ -679,19 +767,23 @@ void handleCommand(String line) {
   } else if (command == "show" || command == "status") {
     printStatus();
   } else if (command == "sensor") {
-    const int sensor = analogRead(SENSOR_PIN);
-    Serial.printf("[SENSOR] %d -> %s (threshold=%d)\n",
-                  sensor, colorName(sensorIsWhite(sensor)), config.threshold);
+    Config cfg = getConfig();
+    int adc = readSensor();
+    Serial.printf("[SENSOR] ADC=%d -> %s (threshold=%d)\n",
+                  adc, colorName(adc > cfg.threshold), cfg.threshold);
   } else if (command == "reset") {
-    resetTiming();
-    Serial.println("[RESET] Learned timing cleared; settings kept.");
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    resetTimingLocked();
+    xSemaphoreGive(stateMutex);
+    Serial.println("[RESET] Learned timing cleared; saved settings kept.");
   } else if (command == "defaults") {
     restoreDefaults();
   } else if (command == "theme") {
-    if (!setTheme(value))
+    if (!setTheme(value)) {
       Serial.println("[ERR] Use: theme auto | theme light | theme dark");
-  } else if (value.length() > 0) {
-    const SetResult result = setParameter(command, value);
+    }
+  } else if (value.length()) {
+    SetResult result = setParameter(command, value);
     if (result == SetResult::Invalid) Serial.println("[ERR] Invalid value.");
     else if (result == SetResult::Unknown) Serial.println("[ERR] Unknown setting.");
   } else {
@@ -699,61 +791,71 @@ void handleCommand(String line) {
   }
 }
 
-void processSerial() {
-  while (Serial.available()) {
-    const char c = static_cast<char>(Serial.read());
-
-    if (c == '\n' || c == '\r') {
-      if (serialLine.length() > 0) {
-        handleCommand(serialLine);
-        serialLine = "";
-        printManual();  // Always remind the user what is available.
+void serialTask(void *) {
+  for (;;) {
+    while (Serial.available()) {
+      char c = static_cast<char>(Serial.read());
+      if (c == '\n' || c == '\r') {
+        if (serialLine.length()) {
+          handleCommand(serialLine);
+          serialLine = "";
+          printManual();
+        }
+      } else if (serialLine.length() < 120) {
+        serialLine += c;
       }
-    } else if (serialLine.length() < 120) {
-      serialLine += c;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
+}
+
+void fatal(const char *message) {
+  Serial.println(message);
+  for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(250);
-
+  delay(200);
   pinMode(SENSOR_PIN, INPUT);
   analogReadResolution(12);
 
+  stateMutex = xSemaphoreCreateMutex();
+  if (!stateMutex) fatal("[FATAL] Could not create state mutex.");
   loadConfig();
-  resetTiming();
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  resetTimingLocked();
+  xSemaphoreGive(stateMutex);
 
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 500, 2400);
   servo.write(config.restAngle);
 
   clickQueue = xQueueCreate(CLICK_QUEUE_SIZE, sizeof(ClickCommand));
-  if (!clickQueue) {
-    Serial.println("[FATAL] Could not create servo queue.");
-    while (true) delay(1000);
-  }
-
-  if (xTaskCreatePinnedToCore(
-          servoTask, "dino-servo", 4096, nullptr, 4,
-          &clickTaskHandle, 1) != pdPASS) {
-    Serial.println("[FATAL] Could not create servo task.");
-    while (true) delay(1000);
-  }
-
+  if (!clickQueue) fatal("[FATAL] Could not create servo queue.");
   chooseBackground();
 
+  if (xTaskCreatePinnedToCore(
+          servoTask, "dino-servo", 4096, nullptr, 5,
+          &servoTaskHandle, 1) != pdPASS ||
+      xTaskCreatePinnedToCore(
+          sensorTask, "dino-sensor", 4096, nullptr, 4,
+          &sensorTaskHandle, 0) != pdPASS ||
+      xTaskCreatePinnedToCore(
+          serialTask, "dino-serial", 4096, nullptr, 2,
+          &serialTaskHandle, 0) != pdPASS) {
+    fatal("[FATAL] Could not create FreeRTOS tasks.");
+  }
+
   Serial.println("\nDino ESP32 Auto-Player ready.");
-  Serial.printf("Servo GPIO %d | sensor GPIO %d\n", SERVO_PIN, SENSOR_PIN);
+  Serial.println("Runtime: sensor task + servo task + serial task. loop() stays idle.");
   printStatus();
   printManual();
 }
 
 void loop() {
-  processSerial();
-  processSensor();
-  delay(1);
+  vTaskDelay(portMAX_DELAY);
 }
