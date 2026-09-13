@@ -6,134 +6,120 @@ ESP32 hardware auto-player for Chrome Dino using one analog light sensor and one
 - **Light sensor:** analog GPIO 15
 - **White:** ADC > 200
 - **Black:** ADC < 200
-- **Servo rest:** 35°
-- **Servo press:** 38°
+- **Servo rest / press:** 35° / 38°
 - **Serial:** 115200 baud
 
-The runtime uses FreeRTOS tasks only. `loop()` does no application work.
+The runtime is FreeRTOS-task based. `loop()` does no application work.
 
-## How it works
+## What changed: short and long jumps
 
-Three tasks run independently:
+Chrome Dino has a variable jump: releasing Space early shortens the jump, while holding it longer lets the Dino continue to the full jump arc.
 
-1. **Sensor task** — samples the light sensor every 5 ms, filters the samples, detects obstacle envelopes, and plans jumps.
-2. **Servo task** — waits for precisely scheduled click commands, presses the key, then retracts the servo.
-3. **Serial task** — handles commands and configuration without disturbing sensor timing.
+The firmware now has two profiles:
 
-The sensor task uses one ADC conversion per 5 ms period (200 Hz). A rolling median of three samples plus a small hysteresis removes single-sample noise without continuously hammering the ADC.
+```text
+SHORT: hold 80 ms   modeled airtime 450 ms
+LONG:  hold 160 ms  modeled airtime 520 ms
+```
 
-## Important sensor-width correction
+The existing short-jump settings are preserved. A long jump is used automatically for wide cactus groups.
 
-The physical sensor spot is approximately **2× the width of a normal cactus**.
+You can test both mechanically:
 
-That matters because the sensor starts seeing a cactus before the cactus center reaches the sensor and stops seeing it after the cactus has passed. The firmware therefore does not use the raw optical pulse edges as cactus edges.
+```text
+click
+longclick
+```
 
-With `ratio 2.0`, it removes about **one third of the measured pulse duration from each optical edge** before calculating the cactus position. This is also why the default clear gap is only **40 ms**: the wide sensor already merges very close cactus shapes naturally.
+## How wide groups are detected
 
-`ratio` is configurable and saved in flash.
+Your optical sensor footprint is approximately **2× the width of a normal cactus**. A raw dark pulse therefore contains both the cactus width and the sensor footprint.
 
-## FreeRTOS layout
+The firmware keeps a recent pulse history and estimates a normal single-cactus pulse. From that it separates:
 
-| Task | Core | Priority | Behavior |
+```text
+raw pulse ≈ fixed sensor footprint + obstacle/group width
+```
+
+This is better than applying the old one-third edge correction to every obstacle: the optical footprint stays the same when the cactus group becomes wider.
+
+The estimated group width is reported in approximate **normal-cactus widths**. Default:
+
+```text
+ratio 2.0
+longat 1.60
+```
+
+So a detected group around 2 cactus widths receives the long profile, while a normal single cactus remains on the short profile. During the first few detections after `start`/`reset`, the firmware conservatively uses long jumps while it learns the single-cactus pulse reference.
+
+Wide groups are not fed into the speed estimator, preventing a triple cactus from being mistaken for a sudden slowdown.
+
+## FreeRTOS tasks
+
+| Task | Core | Priority | Job |
 |---|---:|---:|---|
-| Servo | 1 | 5 | Blocks until a command is due; no polling loop |
-| Sensor / planner | 0 | 4 | Periodic with `vTaskDelayUntil()` |
-| Serial console | 0 | 2 | Checks input every 10 ms |
+| Servo | 1 | 5 | Executes scheduled key presses |
+| Sensor / planner | 0 | 4 | 5 ms ADC sampling, filtering, detection, planning |
+| Serial | 0 | 2 | Commands, configuration, queued runtime logs |
 
-The Arduino `loop()` simply blocks indefinitely.
+The sensor and servo tasks do not print directly to Serial. Runtime messages go through a non-blocking log queue so UART output cannot stall obstacle detection.
 
 ## Serial Monitor guide
 
 ### PlatformIO / VS Code
 
 1. Connect the ESP32 by USB.
-2. Open this project in VS Code with PlatformIO.
+2. Open the project in VS Code with PlatformIO.
 3. Upload the firmware.
-4. Open **PlatformIO → Project Tasks → upesy_wroom → Monitor**, or use the Serial Monitor button in the PlatformIO toolbar.
-5. The project already sets the monitor speed to **115200** in `platformio.ini`.
-6. Click inside the monitor terminal, type a command, and press **Enter**.
-
-Example:
-
-```text
-show
-```
-
-The ESP32 responds and then prints the small command manual again. It does this after every command, so you do not have to remember the syntax.
+4. Open **PlatformIO → Project Tasks → upesy_wroom → Monitor**.
+5. The baud rate is already **115200** in `platformio.ini`.
+6. Click the monitor terminal, type a command, and press **Enter**.
 
 ### Arduino IDE
 
-If you use Arduino IDE instead:
+Open **Tools → Serial Monitor**, set **115200 baud**, and use **New Line** or **Both NL & CR**.
 
-1. Open **Tools → Serial Monitor**.
-2. Set baud rate to **115200**.
-3. Select **New Line** or **Both NL & CR** as the line ending.
-4. Type a command and press **Enter**.
+The ESP32 prints the compact manual again after every command.
 
-## First setup
+## First test
 
-### 1. Check the sensor
-
-Put the sensor over normal white game background and run:
+Check the sensor:
 
 ```text
 sensor
 ```
 
-Then put a dark cactus / dark game object under the same sensor area and run it again.
-
-The intended setup is:
+Target:
 
 ```text
 white > 200
 black < 200
 ```
 
-If your readings are different, choose a threshold roughly halfway between the two values:
+If needed:
 
 ```text
 threshold 200
 ```
 
-For example, if white is around 350 and black is around 90, a threshold around 220 is reasonable.
-
-### 2. Check the servo
-
-Run:
+Check both servo actions:
 
 ```text
 click
+longclick
 ```
 
-The servo should press the key and return immediately.
-
-Your current defaults are:
-
-```text
-rest 35
-press 38
-hold 80
-```
-
-### 3. Check the saved setup
-
-Run:
+Then show the saved configuration:
 
 ```text
 show
 ```
 
-Configuration changes are written to ESP32 **NVS flash** immediately. Powering the board off does not erase them.
-
-### 4. Start the game
-
-If Dino is stopped:
+Start/restart Dino:
 
 ```text
 start
 ```
-
-This arms autoplay and sends one click to start/restart the game.
 
 If Dino is already running:
 
@@ -141,7 +127,7 @@ If Dino is already running:
 arm
 ```
 
-To stop autoplay:
+Stop:
 
 ```text
 stop
@@ -149,36 +135,16 @@ stop
 
 ## Commands
 
-The firmware prints this compact reminder after every command:
-
 ```text
-start | arm | stop | click | show | sensor | reset | defaults
+start | arm | stop | click | longclick | show | sensor | reset | defaults
 theme auto|light|dark
 <name> <value>  (auto-saved)
-threshold rest press hold actuator travel mintravel air landing
-clearance gap sample cooldown rearm ratio adapt adaptstep debug
+threshold rest press hold longhold air longair longat
+actuator travel mintravel landing clearance gap sample cooldown rearm
+ratio adapt adaptstep debug
 ```
 
-Examples:
-
-```text
-press 38
-rest 35
-threshold 200
-travel 1550
-ratio 2.0
-sample 5
-gap 40
-adapt on
-debug on
-```
-
-The older syntax still works too:
-
-```text
-set travel_ms 1550
-set click_angle 38
-```
+Old `set ...` syntax still works.
 
 ## Recommended starting configuration
 
@@ -186,84 +152,141 @@ set click_angle 38
 threshold 200
 rest 35
 press 38
+
 hold 80
+longhold 160
+air 450
+longair 520
+longat 1.60
+
 actuator 160
 travel 1550
-air 450
 landing 50
 clearance 100
+
 gap 40
 sample 5
 ratio 2.0
+
 adapt on
 adaptstep 3
+mintravel 350
 ```
 
-These values are starting points, not a replacement for final physical calibration. The most hardware-dependent value is `travel` because it depends on exactly where the sensor is placed relative to the Dino.
+All changed settings are stored immediately in ESP32 NVS flash.
 
-## Calibration guide
+## Debugging the two jump types
 
-Start with:
+Enable:
 
 ```text
 debug on
 start
 ```
 
-A planned jump looks like:
+Typical output:
 
 ```text
-[PLAN] #4 pulse=165 travel=1390 cmd-in=310 late=0 exit-aligned
+[PLAN] #8 SHORT width=1.06 pulse=132 hold=80 air=450 cmd-in=281 late=0 exit-aligned
+[PLAN] #9 LONG width=2.14 pulse=177 hold=160 air=520 cmd-in=196 late=0 exit-aligned
 ```
 
-Use these rules:
+Important fields:
 
-- **Dino jumps too late:** decrease `travel` in small steps, for example 20–40 ms.
-- **Dino jumps too early:** increase `travel` in small steps.
-- **Servo physically reaches the key later than expected:** increase `actuator`.
-- **Dino lands on the end of a cactus:** increase `landing` by 10–20 ms.
-- **One cactus is being split into several detections:** increase `gap` slightly, for example 40 → 50 ms.
-- **Separate obstacles are being treated as one group:** decrease `gap`.
-- **`late` is repeatedly above 0:** the complete obstacle envelope was learned too late for the requested timing. Prefer moving the sensor farther ahead; also check `gap`, `actuator`, and `travel`.
-- **Sensor reading flickers around 200:** first improve physical alignment and lighting. The firmware already uses a 3-sample median and ADC hysteresis; avoid making `sample` extremely small.
+- `SHORT` / `LONG` — selected jump profile.
+- `width` — estimated obstacle width in normal-cactus widths.
+- `pulse` — measured optical pulse duration.
+- `hold` — servo key-down command duration.
+- `air` — planner's expected jump airtime.
+- `late` — how late the planner was when the full obstacle envelope became known.
 
-After moving the sensor or making a large timing change, run:
+## Long-jump tuning
+
+The defaults are intended as a safe starting point.
+
+### A wide group still gets SHORT
+
+Lower the width threshold slightly:
+
+```text
+longat 1.55
+```
+
+Do not make large jumps in this setting. `1.50–1.75` is the useful tuning area for the stated sensor geometry.
+
+### Too many single cacti get LONG
+
+Raise it:
+
+```text
+longat 1.70
+```
+
+### Dino starts the long jump but still lands too soon
+
+First increase the physical hold a little:
+
+```text
+longhold 170
+```
+
+or:
+
+```text
+longhold 180
+```
+
+Chrome Dino reaches a maximum jump arc, so excessively large hold values do not keep increasing the useful jump indefinitely.
+
+If the physical long jump is correct but the planner predicts its landing too early/late, tune the model separately:
+
+```text
+longair 530
+```
+
+Keep `hold` / `air` for the already-working short jump and `longhold` / `longair` for wide groups.
+
+## General timing calibration
+
+- **All jumps too late:** decrease `travel` by about 20–40 ms per test.
+- **All jumps too early:** increase `travel` similarly.
+- **Servo reaches the key later than expected:** increase `actuator`.
+- **Dino lands on the trailing edge:** increase `landing` by 10–20 ms.
+- **One obstacle is split into multiple detections:** slightly increase `gap`.
+- **Different obstacles are merged:** decrease `gap`.
+- **Repeated `late > 0`:** the sensor is physically too close or timing latency is too large.
+
+After moving the sensor or changing major timing values:
 
 ```text
 reset
 ```
 
-This clears learned speed/envelope history but keeps all saved settings.
+This clears learned pulse/speed history but keeps saved configuration.
 
-## Speed adaptation
+## Sensor filtering and speed adaptation
 
-With one light sensor, exact game speed cannot be measured independently because cactus widths vary. However, your sensor footprint is wider than a cactus, which makes optical pulse duration more stable than with a tiny point sensor.
+The sensor task runs every **5 ms (200 Hz)** and uses:
 
-The firmware therefore uses a conservative low-percentile estimate from the last seven obstacle pulses. It only shortens the estimated sensor-to-Dino travel time gradually as the game accelerates.
+- a rolling 3-sample median;
+- ±8 ADC hysteresis around the threshold;
+- a 40 ms envelope-finalization gap.
 
-Defaults:
+Two histories are kept separately:
 
-```text
-adapt on
-adaptstep 3
-mintravel 350
-```
+- a longer pulse history estimates normal cactus width for SHORT/LONG classification;
+- a short-only history estimates speed, so wide groups cannot corrupt acceleration tracking.
 
-The extra safety bias intentionally avoids adapting too aggressively from one unusually narrow cactus.
+## Persistent configuration migration
 
-## Persistent configuration
+Firmware v3 preserves the existing v1/v2 configuration layout when upgrading. Your already-calibrated threshold, servo angles, short hold, travel timing, and other settings are copied into the new configuration. Only the new long-jump fields receive their defaults.
 
-Settings are stored using ESP32 `Preferences` / NVS.
+- Power loss/reset keeps settings.
+- `reset` keeps settings and clears learned runtime history only.
+- `defaults` restores and saves firmware defaults.
+- A full flash/NVS erase clears saved settings.
 
-- Changing a value saves it immediately.
-- Resetting or unplugging the ESP32 keeps it.
-- `reset` keeps saved configuration and only clears learned run timing.
-- `defaults` restores the firmware defaults and saves them.
-- A full ESP32 flash/NVS erase will erase the saved values.
+## Hardware notes
 
-Firmware version 2 migrates version-1 saved settings. Your custom values are retained; old untouched timing defaults are upgraded to the safer task-based defaults.
-
-## Notes
-
-- GPIO 15 is an ESP32 ADC2/strapping pin. This project does not use Wi-Fi, so the ADC2/Wi-Fi conflict is not relevant during normal operation. Make sure the sensor circuit does not force an invalid boot strap level during reset.
-- Power anything larger than a tiny servo from a suitable external supply and connect its ground to ESP32 ground.
+- GPIO 15 is an ESP32 ADC2/strapping pin. This project does not use Wi-Fi, but make sure the sensor circuit does not force an invalid boot strap level during reset.
+- Power anything larger than a tiny servo from a suitable external supply and connect grounds together.
