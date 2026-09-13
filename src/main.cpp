@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include <Preferences.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -13,6 +15,7 @@ constexpr int SERVO_PIN = 18;
 constexpr int SENSOR_PIN = 15;
 constexpr int SENSOR_HYSTERESIS = 8;
 constexpr size_t CLICK_QUEUE_SIZE = 12;
+constexpr size_t LOG_QUEUE_SIZE = 16;
 constexpr size_t HISTORY_SIZE = 7;
 constexpr size_t ADAPT_WARMUP = 5;
 constexpr float DEFAULT_SENSOR_RATIO = 2.0f;
@@ -72,6 +75,10 @@ struct Detector {
   uint32_t plannedJumps = 0;
 };
 
+struct LogMessage {
+  char text[144];
+};
+
 struct UIntSetting {
   const char *name;
   const char *legacy;
@@ -101,6 +108,7 @@ Config config;
 Detector detector;
 float sensorRatio = DEFAULT_SENSOR_RATIO;
 QueueHandle_t clickQueue = nullptr;
+QueueHandle_t logQueue = nullptr;
 SemaphoreHandle_t stateMutex = nullptr;
 TaskHandle_t sensorTaskHandle = nullptr;
 TaskHandle_t servoTaskHandle = nullptr;
@@ -160,6 +168,16 @@ bool parseBool(String s, bool &out) {
     return true;
   }
   return false;
+}
+
+void queueLog(const char *format, ...) {
+  if (!logQueue) return;
+  LogMessage message{};
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message.text, sizeof(message.text), format, args);
+  va_end(args);
+  xQueueSend(logQueue, &message, 0);
 }
 
 // Persistent configuration -------------------------------------------------
@@ -303,7 +321,7 @@ bool queueClick(uint64_t atMs, bool manual, const Config &cfg) {
   ClickCommand cmd{atMs, playGeneration, cfg.pressAngle, cfg.restAngle,
                    cfg.holdMs, manual, cfg.debug};
   if (xQueueSend(clickQueue, &cmd, 0) == pdTRUE) return true;
-  Serial.println("[WARN] Servo queue full; click dropped.");
+  queueLog("[WARN] Servo queue full; click dropped.");
   return false;
 }
 
@@ -368,8 +386,8 @@ void servoTask(void *) {
 
     if (cmd.debug) {
       uint64_t late = actual > cmd.atMs ? actual - cmd.atMs : 0;
-      Serial.printf("[CLICK] task-late=%llu ms\n",
-                    static_cast<unsigned long long>(late));
+      queueLog("[CLICK] task-late=%llu ms",
+               static_cast<unsigned long long>(late));
     }
   }
 }
@@ -384,30 +402,21 @@ void finalizeEnvelopeLocked(uint64_t now) {
   if (!pulseMs) pulseMs = 1;
   updateTravelLocked(pulseMs);
 
-  // A wide optical spot makes the measured pulse wider than the cactus.
-  // ratio=2 means the sensor spot is about twice a normal cactus width.
   float edgeFraction = sensorRatio / (2.0f * (sensorRatio + 1.0f));
   int64_t correction = static_cast<int64_t>(pulseMs * edgeFraction);
-  int64_t entry = static_cast<int64_t>(detector.startMs) +
-                  correction + detector.travelMs;
-  int64_t exit = static_cast<int64_t>(detector.lastObstacleMs) -
-                 correction + detector.travelMs;
-
+  int64_t entry = static_cast<int64_t>(detector.startMs) + correction + detector.travelMs;
+  int64_t exit = static_cast<int64_t>(detector.lastObstacleMs) - correction + detector.travelMs;
   int64_t exitContact = exit + config.landingMs - config.airMs;
   int64_t safeContact = entry - config.clearanceMs;
-  int64_t commandAt =
-      (exitContact < safeContact ? exitContact : safeContact) - config.actuatorMs;
+  int64_t commandAt = (exitContact < safeContact ? exitContact : safeContact) - config.actuatorMs;
 
   bool entrySafety = safeContact < exitContact;
   bool delayedLanding = false;
   bool delayedCooldown = false;
-
   if (detector.hasPlan) {
     int64_t afterLanding = static_cast<int64_t>(detector.lastLandingMs) +
                            config.rearmMs - config.actuatorMs;
-    int64_t afterCooldown =
-        static_cast<int64_t>(detector.lastCommandMs) + config.cooldownMs;
-
+    int64_t afterCooldown = static_cast<int64_t>(detector.lastCommandMs) + config.cooldownMs;
     if (commandAt < afterLanding) {
       commandAt = afterLanding;
       delayedLanding = true;
@@ -435,15 +444,13 @@ void finalizeEnvelopeLocked(uint64_t now) {
     detector.lastCommandMs = executeAt;
     detector.lastLandingMs = executeAt + config.actuatorMs + config.airMs;
     detector.hasPlan = true;
-
-    Serial.printf(
-        "[PLAN] #%lu pulse=%lu travel=%lu cmd-in=%lld late=%llu %s\n",
-        static_cast<unsigned long>(detector.plannedJumps),
-        static_cast<unsigned long>(pulseMs),
-        static_cast<unsigned long>(detector.travelMs),
-        static_cast<long long>(
-            static_cast<int64_t>(executeAt) - static_cast<int64_t>(now)),
-        static_cast<unsigned long long>(lateMs), reason);
+    queueLog("[PLAN] #%lu pulse=%lu travel=%lu cmd-in=%lld late=%llu %s",
+             static_cast<unsigned long>(detector.plannedJumps),
+             static_cast<unsigned long>(pulseMs),
+             static_cast<unsigned long>(detector.travelMs),
+             static_cast<long long>(
+                 static_cast<int64_t>(executeAt) - static_cast<int64_t>(now)),
+             static_cast<unsigned long long>(lateMs), reason);
   }
   resetEnvelopeLocked();
 }
@@ -460,7 +467,6 @@ void sensorTask(void *) {
   for (;;) {
     Config cfg = getConfig();
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(cfg.sampleMs));
-
     samples[sampleIndex] = readSensor();
     sampleIndex = (sampleIndex + 1) % 3;
     int adc = median3(samples[0], samples[1], samples[2]);
@@ -471,10 +477,8 @@ void sensorTask(void *) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     lastSensorValue = adc;
     filteredWhite = classifyWhite(adc, config.threshold, filteredWhite);
-
     if (playing) {
       bool obstacle = filteredWhite != backgroundIsWhite;
-
       if (config.theme == ThemeMode::Auto) {
         if (obstacle) {
           if (!detector.oppositeSinceMs) detector.oppositeSinceMs = now;
@@ -496,16 +500,14 @@ void sensorTask(void *) {
           detector.startMs = now;
         }
         detector.lastObstacleMs = now;
-      } else if (detector.active &&
-                 now - detector.lastObstacleMs >= config.gapMs) {
+      } else if (detector.active && now - detector.lastObstacleMs >= config.gapMs) {
         finalizeEnvelopeLocked(now);
       }
     }
     xSemaphoreGive(stateMutex);
 
     if (themeChanged) {
-      Serial.printf("[THEME] Background rebased to %s.\n",
-                    colorName(newBackground));
+      queueLog("[THEME] Background rebased to %s.", colorName(newBackground));
     }
   }
 }
@@ -534,7 +536,6 @@ void printManual() {
 void printStatus() {
   Config cfg = getConfig();
   int adc = readSensor();
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   float ratio = sensorRatio;
   uint32_t effective = detector.travelMs;
@@ -542,35 +543,25 @@ void printStatus() {
   xSemaphoreGive(stateMutex);
 
   Serial.println("\n=== Dino Auto-Player ===");
-  Serial.printf(
-      "Run=%s | sensor=%d (%s) | threshold=%d | background=%s | theme=%s\n",
-      playing ? "ON" : "OFF", adc, colorName(adc > cfg.threshold),
-      cfg.threshold, colorName(bg), themeName(cfg.theme));
-  Serial.printf("Servo: rest=%d press=%d hold=%lu ms\n",
-                cfg.restAngle, cfg.pressAngle,
+  Serial.printf("Run=%s | sensor=%d (%s) | threshold=%d | background=%s | theme=%s\n",
+                playing ? "ON" : "OFF", adc, colorName(adc > cfg.threshold),
+                cfg.threshold, colorName(bg), themeName(cfg.theme));
+  Serial.printf("Servo: rest=%d press=%d hold=%lu ms\n", cfg.restAngle, cfg.pressAngle,
                 static_cast<unsigned long>(cfg.holdMs));
-  Serial.printf(
-      "Timing: actuator=%lu travel=%lu effective=%lu air=%lu landing=%lu clearance=%lu\n",
-      static_cast<unsigned long>(cfg.actuatorMs),
-      static_cast<unsigned long>(cfg.travelMs),
-      static_cast<unsigned long>(effective),
-      static_cast<unsigned long>(cfg.airMs),
-      static_cast<unsigned long>(cfg.landingMs),
-      static_cast<unsigned long>(cfg.clearanceMs));
+  Serial.printf("Timing: actuator=%lu travel=%lu effective=%lu air=%lu landing=%lu clearance=%lu\n",
+                static_cast<unsigned long>(cfg.actuatorMs), static_cast<unsigned long>(cfg.travelMs),
+                static_cast<unsigned long>(effective), static_cast<unsigned long>(cfg.airMs),
+                static_cast<unsigned long>(cfg.landingMs), static_cast<unsigned long>(cfg.clearanceMs));
   Serial.printf("Sensor: sample=%lu ms gap=%lu ms ratio=%.2f:1 hysteresis=%d\n",
-                static_cast<unsigned long>(cfg.sampleMs),
-                static_cast<unsigned long>(cfg.gapMs), ratio,
-                SENSOR_HYSTERESIS);
+                static_cast<unsigned long>(cfg.sampleMs), static_cast<unsigned long>(cfg.gapMs),
+                ratio, SENSOR_HYSTERESIS);
   Serial.printf("Adapt=%s mintravel=%lu step=%.1f%% | debug=%s | flash=%s\n",
-                onOff(cfg.adapt),
-                static_cast<unsigned long>(cfg.minTravelMs),
-                cfg.adaptStepPct, onOff(cfg.debug),
-                prefsReady ? "ready" : "unavailable");
+                onOff(cfg.adapt), static_cast<unsigned long>(cfg.minTravelMs),
+                cfg.adaptStepPct, onOff(cfg.debug), prefsReady ? "ready" : "unavailable");
 }
 
 void startAutoplay(bool clickToStart) {
   chooseBackground();
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   ++playGeneration;
   resetTimingLocked();
@@ -580,11 +571,8 @@ void startAutoplay(bool clickToStart) {
   xSemaphoreGive(stateMutex);
   clearClickQueue();
 
-  Serial.printf("[START] Armed. Background=%s sensor=%d.\n",
-                colorName(bg), adc);
-  if (clickToStart && queueClick(nowMs(), true)) {
-    Serial.println("[START] Initial click queued.");
-  }
+  Serial.printf("[START] Armed. Background=%s sensor=%d.\n", colorName(bg), adc);
+  if (clickToStart && queueClick(nowMs(), true)) Serial.println("[START] Initial click queued.");
 }
 
 void stopAutoplay() {
@@ -594,7 +582,6 @@ void stopAutoplay() {
   resetEnvelopeLocked();
   int rest = config.restAngle;
   xSemaphoreGive(stateMutex);
-
   clearClickQueue();
   servo.write(rest);
   Serial.println("[STOP] Autoplay stopped.");
@@ -608,9 +595,7 @@ SetResult setParameter(String rawName, String value) {
 
   if (name == "ratio") {
     float ratio;
-    if (!parseFloatValue(value, ratio) || ratio < 0.5f || ratio > 6.0f)
-      return SetResult::Invalid;
-
+    if (!parseFloatValue(value, ratio) || ratio < 0.5f || ratio > 6.0f) return SetResult::Invalid;
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     sensorRatio = ratio;
     xSemaphoreGive(stateMutex);
@@ -619,41 +604,24 @@ SetResult setParameter(String rawName, String value) {
     return SetResult::Changed;
   }
 
-  bool changed = false;
-  bool resetTiming = false;
-  bool refreshBackground = false;
-  bool moveRest = false;
+  bool changed = false, resetTiming = false, refreshBackground = false, moveRest = false;
   xSemaphoreTake(stateMutex, portMAX_DELAY);
 
-  if (name == "threshold" || name == "rest" ||
-      name == "press" || name == "clickangle") {
+  if (name == "threshold" || name == "rest" || name == "press" || name == "clickangle") {
     if (!parseLong(value, number)) {
-      xSemaphoreGive(stateMutex);
-      return SetResult::Invalid;
+      xSemaphoreGive(stateMutex); return SetResult::Invalid;
     }
-
-    if (name == "threshold" && number >= 0 && number <= 4095) {
-      config.threshold = number;
-    } else if (name == "rest" && number >= 0 && number <= 180) {
-      config.restAngle = number;
-    } else if ((name == "press" || name == "clickangle") &&
-               number >= 0 && number <= 180) {
+    if (name == "threshold" && number >= 0 && number <= 4095) config.threshold = number;
+    else if (name == "rest" && number >= 0 && number <= 180) config.restAngle = number;
+    else if ((name == "press" || name == "clickangle") && number >= 0 && number <= 180)
       config.pressAngle = number;
-    } else {
-      xSemaphoreGive(stateMutex);
-      return SetResult::Invalid;
-    }
-
+    else { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
     changed = true;
     refreshBackground = name == "threshold";
     moveRest = name == "rest" && !playing;
   } else if (name == "adapt" || name == "debug" || name == "autotheme") {
     bool flag;
-    if (!parseBool(value, flag)) {
-      xSemaphoreGive(stateMutex);
-      return SetResult::Invalid;
-    }
-
+    if (!parseBool(value, flag)) { xSemaphoreGive(stateMutex); return SetResult::Invalid; }
     if (name == "adapt") {
       config.adapt = flag;
       resetTiming = true;
@@ -661,16 +629,14 @@ SetResult setParameter(String rawName, String value) {
       config.debug = flag;
     } else {
       config.theme = flag ? ThemeMode::Auto
-                          : (backgroundIsWhite ? ThemeMode::Light
-                                               : ThemeMode::Dark);
+                          : (backgroundIsWhite ? ThemeMode::Light : ThemeMode::Dark);
     }
     changed = true;
     refreshBackground = name == "autotheme";
   } else if (name == "adaptstep") {
     float percent;
     if (!parseFloatValue(value, percent) || percent <= 0 || percent > 20) {
-      xSemaphoreGive(stateMutex);
-      return SetResult::Invalid;
+      xSemaphoreGive(stateMutex); return SetResult::Invalid;
     }
     config.adaptStepPct = percent;
     changed = true;
@@ -680,10 +646,8 @@ SetResult setParameter(String rawName, String value) {
       if (!parseLong(value, number) || number < 0 ||
           static_cast<uint32_t>(number) < s.minValue ||
           static_cast<uint32_t>(number) > s.maxValue) {
-        xSemaphoreGive(stateMutex);
-        return SetResult::Invalid;
+        xSemaphoreGive(stateMutex); return SetResult::Invalid;
       }
-
       config.*(s.field) = static_cast<uint32_t>(number);
       changed = true;
       resetTiming = name == "travel" || name == "travelms" ||
@@ -716,7 +680,6 @@ bool setTheme(String value) {
   config.theme = mode;
   resetEnvelopeLocked();
   xSemaphoreGive(stateMutex);
-
   chooseBackground();
   saveConfig();
   Serial.printf("[THEME] %s.\n", themeName(mode));
@@ -743,8 +706,6 @@ void handleCommand(String line) {
   line.trim();
   line.toLowerCase();
   if (!line.length()) return;
-
-  // Keep compatibility with older commands such as "set travel_ms 1550".
   if (line.startsWith("set ")) {
     line.remove(0, 4);
     line.trim();
@@ -755,18 +716,14 @@ void handleCommand(String line) {
   String value = split < 0 ? "" : line.substring(split + 1);
   value.trim();
 
-  if (command == "help" || command == "manual" || command == "?") {
-  } else if (command == "start" || command == "run") {
-    startAutoplay(true);
-  } else if (command == "arm") {
-    startAutoplay(false);
-  } else if (command == "stop" || command == "pause") {
-    stopAutoplay();
-  } else if (command == "click" || command == "jump") {
+  if (command == "help" || command == "manual" || command == "?") {}
+  else if (command == "start" || command == "run") startAutoplay(true);
+  else if (command == "arm") startAutoplay(false);
+  else if (command == "stop" || command == "pause") stopAutoplay();
+  else if (command == "click" || command == "jump") {
     if (queueClick(nowMs(), true)) Serial.println("[MANUAL] Click queued.");
-  } else if (command == "show" || command == "status") {
-    printStatus();
-  } else if (command == "sensor") {
+  } else if (command == "show" || command == "status") printStatus();
+  else if (command == "sensor") {
     Config cfg = getConfig();
     int adc = readSensor();
     Serial.printf("[SENSOR] ADC=%d -> %s (threshold=%d)\n",
@@ -776,23 +733,23 @@ void handleCommand(String line) {
     resetTimingLocked();
     xSemaphoreGive(stateMutex);
     Serial.println("[RESET] Learned timing cleared; saved settings kept.");
-  } else if (command == "defaults") {
-    restoreDefaults();
-  } else if (command == "theme") {
-    if (!setTheme(value)) {
-      Serial.println("[ERR] Use: theme auto | theme light | theme dark");
-    }
+  } else if (command == "defaults") restoreDefaults();
+  else if (command == "theme") {
+    if (!setTheme(value)) Serial.println("[ERR] Use: theme auto | theme light | theme dark");
   } else if (value.length()) {
-    SetResult result = setParameter(command, value);
-    if (result == SetResult::Invalid) Serial.println("[ERR] Invalid value.");
-    else if (result == SetResult::Unknown) Serial.println("[ERR] Unknown setting.");
-  } else {
-    Serial.println("[ERR] Unknown command.");
-  }
+    SetResult r = setParameter(command, value);
+    if (r == SetResult::Invalid) Serial.println("[ERR] Invalid value.");
+    else if (r == SetResult::Unknown) Serial.println("[ERR] Unknown setting.");
+  } else Serial.println("[ERR] Unknown command.");
 }
 
 void serialTask(void *) {
   for (;;) {
+    LogMessage message{};
+    while (xQueueReceive(logQueue, &message, 0) == pdTRUE) {
+      Serial.println(message.text);
+    }
+
     while (Serial.available()) {
       char c = static_cast<char>(Serial.read());
       if (c == '\n' || c == '\r') {
@@ -835,18 +792,16 @@ void setup() {
   servo.write(config.restAngle);
 
   clickQueue = xQueueCreate(CLICK_QUEUE_SIZE, sizeof(ClickCommand));
-  if (!clickQueue) fatal("[FATAL] Could not create servo queue.");
+  logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogMessage));
+  if (!clickQueue || !logQueue) fatal("[FATAL] Could not create runtime queues.");
   chooseBackground();
 
-  if (xTaskCreatePinnedToCore(
-          servoTask, "dino-servo", 4096, nullptr, 5,
-          &servoTaskHandle, 1) != pdPASS ||
-      xTaskCreatePinnedToCore(
-          sensorTask, "dino-sensor", 4096, nullptr, 4,
-          &sensorTaskHandle, 0) != pdPASS ||
-      xTaskCreatePinnedToCore(
-          serialTask, "dino-serial", 4096, nullptr, 2,
-          &serialTaskHandle, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(servoTask, "dino-servo", 4096, nullptr, 5,
+                              &servoTaskHandle, 1) != pdPASS ||
+      xTaskCreatePinnedToCore(sensorTask, "dino-sensor", 4096, nullptr, 4,
+                              &sensorTaskHandle, 0) != pdPASS ||
+      xTaskCreatePinnedToCore(serialTask, "dino-serial", 4096, nullptr, 2,
+                              &serialTaskHandle, 0) != pdPASS) {
     fatal("[FATAL] Could not create FreeRTOS tasks.");
   }
 
