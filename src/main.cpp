@@ -211,11 +211,14 @@ void loadConfig() {
     return;
   }
 
-  if (prefs.getBytesLength("config") == sizeof(config)) {
+  const bool hasSavedConfig =
+      prefs.getBytesLength("config") == sizeof(config);
+
+  if (hasSavedConfig) {
     prefs.getBytes("config", &config, sizeof(config));
   }
 
-  if (!configValid()) {
+  if (!hasSavedConfig || !configValid()) {
     config = Config{};
     saveConfig(false);
     Serial.println("[NVS] Defaults loaded and saved.");
@@ -323,14 +326,17 @@ void servoTask(void *) {
     if (xQueueReceive(clickQueue, &command, portMAX_DELAY) != pdTRUE) continue;
 
     bool cancelled = false;
-    while (nowMs() < command.atMs) {
+    for (;;) {
       if (!command.manual &&
           (!playing || command.generation != playGeneration)) {
         cancelled = true;
         break;
       }
 
-      uint64_t remaining = command.atMs - nowMs();
+      const uint64_t now = nowMs();
+      if (now >= command.atMs) break;
+
+      const uint64_t remaining = command.atMs - now;
       uint32_t sleepMs = remaining > 5 ? 5 : static_cast<uint32_t>(remaining);
       if (!sleepMs) sleepMs = 1;
       vTaskDelay(pdMS_TO_TICKS(sleepMs));
@@ -647,7 +653,7 @@ void restoreDefaults() {
 void handleCommand(String line) {
   line.trim();
   line.toLowerCase();
-  if (line.isEmpty()) return;
+  if (line.length() == 0) return;
 
   // Old commands such as "set travel_ms 1550" still work.
   if (line.startsWith("set ")) {
@@ -684,7 +690,7 @@ void handleCommand(String line) {
   } else if (command == "theme") {
     if (!setTheme(value))
       Serial.println("[ERR] Use: theme auto | theme light | theme dark");
-  } else if (!value.isEmpty()) {
+  } else if (value.length() > 0) {
     const SetResult result = setParameter(command, value);
     if (result == SetResult::Invalid) Serial.println("[ERR] Invalid value.");
     else if (result == SetResult::Unknown) Serial.println("[ERR] Unknown setting.");
@@ -698,7 +704,7 @@ void processSerial() {
     const char c = static_cast<char>(Serial.read());
 
     if (c == '\n' || c == '\r') {
-      if (!serialLine.isEmpty()) {
+      if (serialLine.length() > 0) {
         handleCommand(serialLine);
         serialLine = "";
         printManual();  // Always remind the user what is available.
