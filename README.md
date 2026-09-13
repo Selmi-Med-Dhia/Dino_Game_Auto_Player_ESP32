@@ -10,137 +10,151 @@ ESP32 hardware auto-player for Chrome Dino using one analog light sensor and one
 
 ## Default behavior
 
-The firmware is **armed automatically after every ESP32 boot/reset**.
+The firmware is armed automatically after every ESP32 boot/reset.
 
-After boot it waits for the next cactus. When that first cactus finishes passing the sensor, the ESP defines:
-
-```text
-round frame = 0
-round time  = 0
-```
-
-That cactus is still handled normally. If the ESP32 is reset during a game, the next cactus becomes the new frame-0 reference.
-
-## Exact Chromium acceleration rule
-
-The Chromium Dino source does **not** increase speed every N cacti.
-
-Normal mode uses:
+It waits for the next cactus. When that first cactus finishes passing the sensor, that obstacle becomes the timing baseline:
 
 ```text
-start speed   = 6
-acceleration  = 0.001 per animation-frame update
-maximum speed = 13
+round time = 0
+scale      = x1.000
 ```
 
-The game update loop does the equivalent of:
+The first cactus is still jumped normally.
+
+## Why the previous acceleration model drifted
+
+The base `travel` value is calibrated at the first cactus seen by the sensor, not at the instant the browser game starts.
+
+Chromium-style Dino code starts at:
 
 ```text
-if (currentSpeed < 13)
-    currentSpeed += 0.001;
+SPEED        = 6
+ACCELERATION = 0.001 per animation-frame update
+MAX_SPEED    = 13
+CLEAR_TIME   = 3000 ms
 ```
 
-So speed changes in discrete but very small steps: one `0.001` step for each browser animation frame.
+The game already spends about 3000 ms accelerating before it is allowed to create the first obstacle. Therefore the first cactus is already moving faster than speed 6.
 
-The ESP mirrors that rule from the first-cactus reference:
+At 60 Hz:
 
 ```text
-frame = floor(round_time_ms * gamefps / 1000)
-frame = min(frame, 7000)
-
-speed = 6 + 0.001 * frame
-speed = min(speed, 13)
+first cactus baseline ≈ frame 180
+baseline game speed   ≈ 6.180
 ```
 
-Only horizontal-motion timings scale:
+At 144 Hz:
 
 ```text
-effective travel = configured travel / (speed / 6)
-effective gap    = configured gap    / (speed / 6)
+first cactus baseline ≈ frame 432
+baseline game speed   ≈ 6.432
 ```
 
-Servo angles, short/long key holds and vertical jump airtime remain unchanged.
+Your configured:
 
-## Important: browser refresh rate
+```text
+travel 1550
+gap 40
+```
 
-Chromium schedules the game update with `requestAnimationFrame()`. Browser animation callbacks normally follow the display refresh rate.
+must remain exactly those values at the first-cactus baseline. Scaling starts after that.
 
-Therefore the exact time required to accumulate 7000 speed steps depends on the monitor running Chrome.
+The firmware now uses:
 
-Default:
+```text
+base_frame = firstdelay * gamefps / 1000
+base_speed = 6 + 0.001 * base_frame
+
+current_frame = base_frame + round_elapsed_frames
+current_speed = 6 + 0.001 * current_frame
+
+scale = current_speed / base_speed
+
+effective_travel = travel / scale
+effective_gap    = gap / scale
+```
+
+Speed is capped at 13.
+
+## chromedino.com
+
+`chromedino.com` is a hosted Chromium-derived runner, not the browser's built-in `chrome://dino` page.
+
+Public reverse-engineering of the site shows the familiar global `Runner.instance_` API and Chromium-style update rule:
+
+```text
+currentSpeed += config.ACCELERATION
+```
+
+Its historical game script is the Chromium-derived `game.js?v=2`, so the main speed constants are compatible with this firmware. The important mismatch was the first-cactus baseline described above.
+
+For `chromedino.com`, start with:
+
+```text
+firstdelay 3000
+```
+
+If long-run timing is still slightly early/late, adjust `firstdelay` in small steps:
+
+```text
+firstdelay 3200
+firstdelay 2800
+```
+
+This value is persisted in NVS.
+
+## Best game targets
+
+### Exact browser target
+
+Use Chrome's built-in page:
+
+```text
+chrome://dino
+```
+
+This is the safest target because it is the actual Chromium game.
+
+### HTTPS Chromium-derived target
+
+A good online alternative is:
+
+```text
+https://litetex.github.io/t-rex-runner/
+```
+
+That project is maintained as a standalone extraction of Chromium's T-Rex runner.
+
+## Browser refresh rate
+
+The game update uses `requestAnimationFrame()`, so the rate of `+0.001` steps follows the animation callback rate.
+
+Set:
 
 ```text
 gamefps 60
 ```
 
-Examples:
-
-| Display | +0.001 steps/sec | Time from 6 to 13 |
-|---:|---:|---:|
-| 60 Hz | 60 | ~116.7 s |
-| 75 Hz | 75 | ~93.3 s |
-| 120 Hz | 120 | ~58.3 s |
-| 144 Hz | 144 | ~48.6 s |
-| 165 Hz | 165 | ~42.4 s |
-
-Set the value to the refresh rate of the display where Chrome Dino is running:
+or your display refresh rate, for example:
 
 ```text
 gamefps 144
 ```
 
-On Windows this is normally visible under **Settings → System → Display → Advanced display → Choose a refresh rate**.
-
-`gamefps` is stored separately in NVS, so it survives power loss without changing the existing firmware-v3 configuration layout.
-
-## Why the game can look like it speeds up in bigger steps
-
-Some obstacle behavior unlocks only after speed thresholds. That can make progression look step-like even though speed itself is updated every animation frame.
-
-Examples from the Chromium game logic include:
-
-```text
-large cactus multiples: allowed from speed 7
-pterodactyl:            allowed from speed 8.5
-```
-
-So the appearance of new obstacle patterns is stepped; the speed update itself is not based on cactus count.
-
-## Default 60 Hz timing example
-
-With:
-
-```text
-travel 1550
-gap 40
-gamefps 60
-```
-
-the frame-stepped model is approximately:
-
-| Round time | Emulated frame | Game speed | Speed factor | Travel | Gap |
-|---:|---:|---:|---:|---:|---:|
-| 0 s | 0 | 6.000 | x1.000 | 1550 ms | 40 ms |
-| 15 s | 900 | 6.900 | x1.150 | 1348 ms | 35 ms |
-| 30 s | 1800 | 7.800 | x1.300 | 1192 ms | 31 ms |
-| 60 s | 3600 | 9.600 | x1.600 | 969 ms | 25 ms |
-| 90 s | 5400 | 11.400 | x1.900 | 816 ms | 21 ms |
-| ~116.7 s+ | 7000 | 13.000 | x2.167 | ~715 ms | ~18 ms |
-
-Between those rows, the value changes one frame step at a time rather than as a continuous formula.
+`gamefps` is persisted in NVS.
 
 ## Short and long jumps
 
-The existing dual-jump behavior is unchanged:
+The dual-jump behavior is unchanged:
 
 ```text
 SHORT: hold 80 ms, modeled air 450 ms
 LONG:  hold 160 ms, modeled air 520 ms
 ```
 
-The optical sensor footprint is approximately 2× a normal cactus width. Pulse duration remains useful for estimating obstacle/group width and selecting SHORT vs LONG.
+The optical pulse is still used to estimate obstacle/group width and choose SHORT vs LONG.
 
-**Pulse duration is not used for acceleration.**
+It is **not** used to estimate game speed.
 
 Defaults:
 
@@ -149,25 +163,7 @@ ratio 2.0
 longat 1.60
 ```
 
-## Serial Monitor
-
-PlatformIO / VS Code:
-
-1. Connect the ESP32.
-2. Upload the firmware.
-3. Open **PlatformIO → Project Tasks → upesy_wroom → Monitor**.
-4. Use 115200 baud.
-5. Type a command and press Enter.
-
-Arduino IDE:
-
-1. Open **Tools → Serial Monitor**.
-2. Set **115200 baud**.
-3. Select **New Line** or **Both NL & CR**.
-
-The compact command reminder is printed after every command.
-
-## Commands
+## Serial commands
 
 ```text
 start | arm | stop | click | longclick | show | sensor | reset | defaults
@@ -175,34 +171,63 @@ theme auto|light|dark
 
 threshold rest press hold longhold air longair longat
 actuator travel mintravel landing clearance gap sample cooldown rearm
-ratio gamefps adapt debug
+ratio gamefps firstdelay adapt debug
 ```
 
-Examples:
+Important settings:
 
 ```text
-show
 gamefps 60
-gamefps 144
+firstdelay 3000
 adapt on
 debug on
 ```
 
-Old `set ...` syntax still works.
+## Debug output
 
-## Round-control commands
+With:
+
+```text
+debug on
+```
+
+planner output includes both the estimated absolute game speed and the scale relative to the first cactus:
+
+```text
+[PLAN] #12 SHORT width=1.05 round=30.0s frame=1980 game=7.980 scale=x1.291 travel=1200 gap=31 hold=80 ...
+```
+
+At 60 Hz with `firstdelay 3000`:
+
+```text
+round 0 s:
+base frame = 180
+game speed = 6.180
+scale      = x1.000
+travel     = 1550 ms
+
+round 30 s:
+frame      = 1980
+game speed = 7.980
+scale      = x1.291
+travel     ≈ 1200 ms
+```
+
+This is different from incorrectly scaling against speed 6.000.
+
+## Round controls
 
 `reset`
 
-Clears the round/frame counter and width history while leaving autoplay armed. The next cactus becomes frame 0.
+Clears the round clock and width history, keeps autoplay armed, and makes the next cactus the new x1.000 timing baseline.
 
 `start`
 
-Resets the round and sends one short click to start/restart Dino. The first cactus after that becomes frame 0.
+Resets the round and sends one short click to start/restart Dino.
 
 `arm`
 
-Resets the round without pressing the key. Usually unnecessary because boot already auto-arms.
+Resets the round without pressing the key.
 
 `stop`
 
@@ -210,37 +235,11 @@ Stops automatic play.
 
 `adapt on`
 
-Uses Chromium frame-step acceleration.
+Enables frame-based acceleration scaling.
 
 `adapt off`
 
-Keeps configured `travel` and `gap` fixed.
-
-## Debug output
-
-Enable:
-
-```text
-debug on
-```
-
-A planner line now includes the exact emulated Chromium frame number:
-
-```text
-[PLAN] #12 SHORT width=1.05 round=30.0s frame=1800 speed=x1.300 travel=1192 gap=31 hold=80 cmd-in=220 late=0 exit-aligned
-```
-
-Useful fields:
-
-- `round` — elapsed time since the first cactus reference.
-- `frame` — emulated browser animation-frame count.
-- `speed` — current speed factor relative to speed 6.
-- `travel` / `gap` — current scaled horizontal timings.
-- `SHORT` / `LONG` — selected jump type.
-- `width` — estimated obstacle/group width.
-- `late` — scheduling lateness.
-
-`show` prints the same frame/speed state plus the configured `gamefps`.
+Uses fixed `travel` and `gap`.
 
 ## Current base configuration
 
@@ -264,30 +263,27 @@ clearance 100
 gap 40
 sample 5
 ratio 2.0
-gamefps 60
 
+gamefps 60
+firstdelay 3000
 adapt on
 ```
 
-All normal configuration changes are saved in ESP32 NVS. `gamefps` and `ratio` are also persisted in NVS.
-
-## Notes on `adaptstep`
-
-`adaptstep` remains in the old saved firmware-v3 structure only for binary/NVS compatibility. It is no longer used by acceleration logic.
+All settings are persisted in NVS. `firstdelay`, `gamefps`, and `ratio` are stored separately so the firmware-v3 `Config` layout remains unchanged.
 
 ## FreeRTOS tasks
 
 | Task | Core | Priority | Job |
 |---|---:|---:|---|
 | Servo | 1 | 5 | Executes scheduled short/long key presses |
-| Sensor / planner | 0 | 4 | Samples sensor, tracks round/frame time, classifies obstacles and plans jumps |
+| Sensor / planner | 0 | 4 | Samples sensor, tracks round timing, classifies obstacles and plans jumps |
 | Serial | 0 | 2 | Commands and queued runtime logs |
 
-Sensor and servo tasks never print directly to Serial.
+Sensor and servo tasks do not print directly to Serial.
 
 ## Rollback
 
-The known-good pre-acceleration version is still preserved on branch:
+The known-good pre-acceleration version is preserved on branch:
 
 ```text
 working-without-acceleration
