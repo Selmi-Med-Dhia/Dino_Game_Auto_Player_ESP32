@@ -10,79 +10,139 @@ ESP32 hardware auto-player for Chrome Dino using one analog light sensor and one
 
 ## Default behavior
 
-The firmware is now **armed automatically after every ESP32 boot/reset**.
+The firmware is **armed automatically after every ESP32 boot/reset**.
 
-You do not need to type `arm`.
-
-After boot, it waits for the next cactus. When that first cactus finishes passing the sensor:
+After boot it waits for the next cactus. When that first cactus finishes passing the sensor, the ESP defines:
 
 ```text
-round time = 0
+round frame = 0
+round time  = 0
 ```
 
-That same first cactus is still handled normally. From then on, acceleration is calculated only from elapsed round time.
+That cactus is still handled normally. If the ESP32 is reset during a game, the next cactus becomes the new frame-0 reference.
 
-If you reset the ESP32 in the middle of a Dino run, the round clock is cleared. The next cactus becomes the new `t = 0`.
+## Exact Chromium acceleration rule
 
-## Acceleration model
+The Chromium Dino source does **not** increase speed every N cacti.
 
-Acceleration no longer depends on how long a cactus stays under the sensor.
-
-That approach is unsuitable because single, double and triple cactus groups have different optical pulse widths.
-
-The firmware now uses a deterministic Chrome-Dino-style speed curve:
+Normal mode uses:
 
 ```text
-speed = 6.0 + 0.060 * round_seconds
-maximum speed = 13.0
+start speed   = 6
+acceleration  = 0.001 per animation-frame update
+maximum speed = 13
 ```
 
-The first cactus after boot/reset is the reference point (`speed x1.00`).
-
-Only timings related to horizontal screen motion are scaled:
+The game update loop does the equivalent of:
 
 ```text
-effective travel = configured travel / speed factor
-effective gap    = configured gap / speed factor
+if (currentSpeed < 13)
+    currentSpeed += 0.001;
 ```
 
-The physical jump calibration does **not** scale:
+So speed changes in discrete but very small steps: one `0.001` step for each browser animation frame.
+
+The ESP mirrors that rule from the first-cactus reference:
 
 ```text
-SHORT hold = 80 ms
-LONG  hold = 160 ms
-SHORT air  = 450 ms
-LONG  air  = 520 ms
-servo angles stay unchanged
+frame = floor(round_time_ms * gamefps / 1000)
+frame = min(frame, 7000)
+
+speed = 6 + 0.001 * frame
+speed = min(speed, 13)
 ```
 
-With the default `travel 1550` and `gap 40`:
+Only horizontal-motion timings scale:
 
-| Round time | Speed factor | Travel | Gap |
-|---:|---:|---:|---:|
-| 0 s | x1.00 | 1550 ms | 40 ms |
-| 15 s | x1.15 | 1348 ms | 35 ms |
-| 30 s | x1.30 | 1192 ms | 31 ms |
-| 60 s | x1.60 | 969 ms | 25 ms |
-| 90 s | x1.90 | 816 ms | 21 ms |
-| ~117 s+ | x2.17 | ~715 ms | ~18 ms |
+```text
+effective travel = configured travel / (speed / 6)
+effective gap    = configured gap    / (speed / 6)
+```
 
-`mintravel` still limits how low travel can go.
+Servo angles, short/long key holds and vertical jump airtime remain unchanged.
+
+## Important: browser refresh rate
+
+Chromium schedules the game update with `requestAnimationFrame()`. Browser animation callbacks normally follow the display refresh rate.
+
+Therefore the exact time required to accumulate 7000 speed steps depends on the monitor running Chrome.
+
+Default:
+
+```text
+gamefps 60
+```
+
+Examples:
+
+| Display | +0.001 steps/sec | Time from 6 to 13 |
+|---:|---:|---:|
+| 60 Hz | 60 | ~116.7 s |
+| 75 Hz | 75 | ~93.3 s |
+| 120 Hz | 120 | ~58.3 s |
+| 144 Hz | 144 | ~48.6 s |
+| 165 Hz | 165 | ~42.4 s |
+
+Set the value to the refresh rate of the display where Chrome Dino is running:
+
+```text
+gamefps 144
+```
+
+On Windows this is normally visible under **Settings → System → Display → Advanced display → Choose a refresh rate**.
+
+`gamefps` is stored separately in NVS, so it survives power loss without changing the existing firmware-v3 configuration layout.
+
+## Why the game can look like it speeds up in bigger steps
+
+Some obstacle behavior unlocks only after speed thresholds. That can make progression look step-like even though speed itself is updated every animation frame.
+
+Examples from the Chromium game logic include:
+
+```text
+large cactus multiples: allowed from speed 7
+pterodactyl:            allowed from speed 8.5
+```
+
+So the appearance of new obstacle patterns is stepped; the speed update itself is not based on cactus count.
+
+## Default 60 Hz timing example
+
+With:
+
+```text
+travel 1550
+gap 40
+gamefps 60
+```
+
+the frame-stepped model is approximately:
+
+| Round time | Emulated frame | Game speed | Speed factor | Travel | Gap |
+|---:|---:|---:|---:|---:|---:|
+| 0 s | 0 | 6.000 | x1.000 | 1550 ms | 40 ms |
+| 15 s | 900 | 6.900 | x1.150 | 1348 ms | 35 ms |
+| 30 s | 1800 | 7.800 | x1.300 | 1192 ms | 31 ms |
+| 60 s | 3600 | 9.600 | x1.600 | 969 ms | 25 ms |
+| 90 s | 5400 | 11.400 | x1.900 | 816 ms | 21 ms |
+| ~116.7 s+ | 7000 | 13.000 | x2.167 | ~715 ms | ~18 ms |
+
+Between those rows, the value changes one frame step at a time rather than as a continuous formula.
 
 ## Short and long jumps
 
-The existing dual-jump behavior is unchanged.
+The existing dual-jump behavior is unchanged:
 
 ```text
 SHORT: hold 80 ms, modeled air 450 ms
 LONG:  hold 160 ms, modeled air 520 ms
 ```
 
-The optical sensor footprint is approximately 2× a normal cactus width. The firmware keeps a recent pulse history only for estimating obstacle/group width and selecting SHORT vs LONG.
+The optical sensor footprint is approximately 2× a normal cactus width. Pulse duration remains useful for estimating obstacle/group width and selecting SHORT vs LONG.
 
-Pulse duration is **not used for speed anymore**.
+**Pulse duration is not used for acceleration.**
 
-Default:
+Defaults:
 
 ```text
 ratio 2.0
@@ -105,7 +165,7 @@ Arduino IDE:
 2. Set **115200 baud**.
 3. Select **New Line** or **Both NL & CR**.
 
-The firmware prints the command reminder after every command.
+The compact command reminder is printed after every command.
 
 ## Commands
 
@@ -115,32 +175,34 @@ theme auto|light|dark
 
 threshold rest press hold longhold air longair longat
 actuator travel mintravel landing clearance gap sample cooldown rearm
-ratio adapt debug
+ratio gamefps adapt debug
+```
+
+Examples:
+
+```text
+show
+gamefps 60
+gamefps 144
+adapt on
+debug on
 ```
 
 Old `set ...` syntax still works.
 
-### Important commands
-
-`show`
-
-Shows current round state, elapsed time, speed factor and effective timing.
+## Round-control commands
 
 `reset`
 
-Resets the round clock and learned width history while keeping autoplay armed and preserving all saved configuration.
-
-```text
-[RESET] Round reset. Autoplay remains armed; the next cactus becomes t=0.
-```
+Clears the round/frame counter and width history while leaving autoplay armed. The next cactus becomes frame 0.
 
 `start`
 
-Resets the round and sends one short servo click to start/restart Dino. The first cactus after that click becomes round `t = 0`.
+Resets the round and sends one short click to start/restart Dino. The first cactus after that becomes frame 0.
 
 `arm`
 
-Resets the round without pressing the key. Usually unnecessary because the firmware auto-arms on boot.
+Resets the round without pressing the key. Usually unnecessary because boot already auto-arms.
 
 `stop`
 
@@ -148,39 +210,39 @@ Stops automatic play.
 
 `adapt on`
 
-Enables round-time acceleration scaling.
+Uses Chromium frame-step acceleration.
 
 `adapt off`
 
-Keeps `travel` and `gap` fixed.
+Keeps configured `travel` and `gap` fixed.
 
 ## Debug output
 
-Recommended:
+Enable:
 
 ```text
 debug on
 ```
 
-A planned jump now looks like:
+A planner line now includes the exact emulated Chromium frame number:
 
 ```text
-[PLAN] #12 SHORT width=1.05 round=43.2s speed=x1.43 travel=1084 gap=28 hold=80 cmd-in=220 late=0 exit-aligned
+[PLAN] #12 SHORT width=1.05 round=30.0s frame=1800 speed=x1.300 travel=1192 gap=31 hold=80 cmd-in=220 late=0 exit-aligned
 ```
 
 Useful fields:
 
-- `round` — seconds since the first cactus passed.
-- `speed` — deterministic round-time speed factor.
-- `travel` — current scaled sensor-to-Dino timing.
-- `gap` — current scaled obstacle-envelope gap.
+- `round` — elapsed time since the first cactus reference.
+- `frame` — emulated browser animation-frame count.
+- `speed` — current speed factor relative to speed 6.
+- `travel` / `gap` — current scaled horizontal timings.
 - `SHORT` / `LONG` — selected jump type.
 - `width` — estimated obstacle/group width.
 - `late` — scheduling lateness.
 
-For a normal run, `speed` should rise steadily with time even if every obstacle is a different cactus group.
+`show` prints the same frame/speed state plus the configured `gamefps`.
 
-## Current starting configuration
+## Current base configuration
 
 ```text
 threshold 200
@@ -202,35 +264,36 @@ clearance 100
 gap 40
 sample 5
 ratio 2.0
+gamefps 60
 
 adapt on
 ```
 
-All changed settings are saved immediately in ESP32 NVS.
+All normal configuration changes are saved in ESP32 NVS. `gamefps` and `ratio` are also persisted in NVS.
 
 ## Notes on `adaptstep`
 
-`adaptstep` remains in the saved v3 configuration for backward compatibility, but timed acceleration does not use per-obstacle adaptation anymore. Existing NVS data therefore remains compatible without being erased.
+`adaptstep` remains in the old saved firmware-v3 structure only for binary/NVS compatibility. It is no longer used by acceleration logic.
 
 ## FreeRTOS tasks
 
 | Task | Core | Priority | Job |
 |---|---:|---:|---|
 | Servo | 1 | 5 | Executes scheduled short/long key presses |
-| Sensor / planner | 0 | 4 | Samples sensor, tracks round clock, classifies obstacles, plans jumps |
+| Sensor / planner | 0 | 4 | Samples sensor, tracks round/frame time, classifies obstacles and plans jumps |
 | Serial | 0 | 2 | Commands and queued runtime logs |
 
 Sensor and servo tasks never print directly to Serial.
 
 ## Rollback
 
-The previously working pre-acceleration version remains preserved on branch:
+The known-good pre-acceleration version is still preserved on branch:
 
 ```text
 working-without-acceleration
 ```
 
-That branch points to commit:
+pointing to:
 
 ```text
 d976f2a79c45c9dc18495b80f0875f7248376cbf
@@ -238,6 +301,6 @@ d976f2a79c45c9dc18495b80f0875f7248376cbf
 
 ## Hardware notes
 
-GPIO 15 is an ESP32 ADC2/strapping pin. This project does not use Wi-Fi. Make sure the sensor circuit does not force an invalid boot strap level during reset.
+GPIO 15 is an ESP32 ADC2/strapping pin. Wi-Fi is not used here. Make sure the sensor circuit does not force an invalid boot strap level during reset.
 
 Power anything larger than a tiny servo from a suitable external supply and connect the grounds together.
